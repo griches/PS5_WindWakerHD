@@ -1,0 +1,3 @@
+[submodule "vendor/wwhd"]
+	path = vendor/wwhd
+	url = https://github.com/ZeldaWWHDRecomp/ZeldaWWHDRecomp

@@ -1,0 +1,25 @@
+.DS_Store
+build/
+dist/
+klog/
+.deps/
+gamedata/
+*.log
+imgui.ini
+# never: disc images
+*.iso
+*.ciso
+*.gcm
+*.rvz
+*.gci
+# never: the game, anything made from it, and keys
+dump/
+game/
+gen/
+*.wud
+*.wux
+*.wua
+*.rpx
+*.key
+*.sav
+vendor/wwhd/build/

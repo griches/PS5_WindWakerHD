@@ -1,0 +1,569 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4ae364f..5388bfd 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -141,6 +141,11 @@ elseif(ANDROID)
+   list(APPEND RUNTIME_SOURCES runtime/src/platform/https_android.cpp)
+ elseif(WIN32)
+   list(APPEND RUNTIME_SOURCES runtime/src/platform/https_win.cpp)
++elseif(PROSPERO)
++  # PlayStation 5: no downloads (the catalogue of mods is not reachable from a title)
++  list(APPEND RUNTIME_SOURCES ${PS5_PORT_DIR}/ps5/src/https_ps5.cpp ${PS5_PORT_DIR}/ps5/src/guestmem_ps5.cpp
++       ${PS5_PORT_DIR}/ps5/src/ime_ps5.cpp ${PS5_PORT_DIR}/ps5/src/sampler_ps5.cpp
++       ${PS5_PORT_DIR}/ps5/src/controller_ps5.cpp)
+ elseif(UNIX AND NOT ANDROID)
+   # libcurl is loaded at run time (dlopen); only its headers are needed. They are copied on their own:
+   # their directory (e.g. /usr/include/x86_64-linux-gnu) also holds the system's glibc headers, which
+@@ -204,7 +209,7 @@ if(NOT TARGET ZLIB::ZLIB)
+   find_package(ZLIB REQUIRED)
+ endif()
+ find_package(Threads REQUIRED)
+-if(UNIX AND NOT APPLE AND NOT ANDROID)
++if(UNIX AND NOT APPLE AND NOT ANDROID AND NOT PROSPERO)
+   target_include_directories(wwhd PRIVATE ${WWHD_CURL_INCLUDE})
+   target_link_libraries(wwhd PRIVATE ${CMAKE_DL_LIBS})
+ endif()
+diff --git a/runtime/include/ppc.h b/runtime/include/ppc.h
+index 56ba99a..789b723 100644
+--- a/runtime/include/ppc.h
++++ b/runtime/include/ppc.h
+@@ -12,7 +12,8 @@
+ extern "C" {
+ #endif
+ 
+-#if defined(__ANDROID__) || (defined(__linux__) && defined(__aarch64__))
++#if defined(__ANDROID__) || (defined(__linux__) && defined(__aarch64__)) || defined(__PROSPERO__)
++/* (PlayStation 5: no range at or above 1 TiB is granted to a title) */
+ /* arm64 Linux kernels (Android, Raspberry Pi OS and other 4K-page configurations) often have a 39-bit
+    user address space (512 GiB), where 32 TiB is out of reach: stay well below it (64 GiB) */
+ #define PPC_MEM_BASE ((uint8_t*)0x1000000000ull)
+diff --git a/runtime/src/core.cpp b/runtime/src/core.cpp
+index 5b1c562..9241240 100644
+--- a/runtime/src/core.cpp
++++ b/runtime/src/core.cpp
+@@ -94,6 +94,9 @@ void fatal(const char* fmt, ...) {
+ }
+ 
+ // ---------------------------------------------------------------- memory
++#ifdef __PROSPERO__
++extern "C" bool ps5_guest_memory_init(void);
++#endif
+ namespace mem {
+ static std::atomic<uint32_t> g_runtime_top{kRuntimeStart};
+ 
+@@ -108,6 +111,9 @@ void init() {
+     void* p = VirtualAlloc(PPC_MEM_BASE, 0x100000000ull, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+     if(p != PPC_MEM_BASE) fatal("cannot reserve guest address space (error=%lu)",GetLastError());
+     DWORD old; if(!VirtualProtect(PPC_MEM_BASE,0x10000,PAGE_NOACCESS,&old)) fatal("cannot protect guest null page");
++#elif defined(__PROSPERO__)
++    // PlayStation 5: a reservation with direct memory mapped into it (ps5/src/guestmem_ps5.cpp)
++    if (!ps5_guest_memory_init()) fatal("cannot reserve guest address space at %p", PPC_MEM_BASE);
+ #else
+     // Never replace existing mappings: requesting a hint and checking the result is safe on
+     // systems whose headers lack MAP_FIXED_NOREPLACE.
+diff --git a/runtime/src/full_state_header.h b/runtime/src/full_state_header.h
+index fbad62c..46b17c9 100644
+--- a/runtime/src/full_state_header.h
++++ b/runtime/src/full_state_header.h
+@@ -43,6 +43,12 @@ inline const char* controller_label(int mode) {
+ }
+ // Absent metadata leaves the host's choice intact (legacy states).
+ inline bool restored_pro_controller(int mode, bool current) {
++#ifdef __PROSPERO__
++    // PlayStation 5: the pad stays what it is. A state from a GamePad session would otherwise put
++    // the game's menus back on a GamePad screen the console does not have.
++    (void)mode;
++    return current;
++#endif
+     return mode == 0 ? current : mode == 2;
+ }
+ } // namespace ss
+diff --git a/runtime/src/gfx/vulkan/backend.cpp b/runtime/src/gfx/vulkan/backend.cpp
+index 7ac593e..4dea30b 100644
+--- a/runtime/src/gfx/vulkan/backend.cpp
++++ b/runtime/src/gfx/vulkan/backend.cpp
+@@ -1022,7 +1022,11 @@ void wait_idle() {
+ }
+ void with_autorelease_pool(void (*fn)()) { host::with_autorelease_pool(fn); }
+ uint64_t frames_completed() { return R.completed.load(); }
++#ifdef __cpp_lib_atomic_ref
+ uint64_t frame_count() { return std::atomic_ref<uint64_t>(R.frame).load(); }
++#else  // libc++ before 19 (the PS5 payload SDK's) has no std::atomic_ref
++uint64_t frame_count() { return __atomic_load_n(&R.frame, __ATOMIC_SEQ_CST); }
++#endif
+ static bool has_extension(const std::vector<VkExtensionProperties> &es,
+                           const char *name) {
+   return std::any_of(es.begin(), es.end(),
+@@ -2217,7 +2221,7 @@ static void frame_dumps(uint64_t frame) {
+   if (captureRequested.exchange(false) || frame == scripted) {
+     char dir[64];
+     time_t t = time(nullptr);
+-    strftime(dir, sizeof dir, "captures/%Y%m%d-%H%M%S", localtime(&t));
++    strftime(dir, sizeof dir, WWHD_CAPTURES "/%Y%m%d-%H%M%S", localtime(&t));
+     std::error_code ec;
+     std::filesystem::create_directories(dir, ec);
+     dump_scan(R.tv, std::string(dir) + "/tv.png");
+@@ -2246,6 +2250,18 @@ std::vector<Buffer> shotBuffersDone;
+ }  // namespace
+ static void take_screenshots(const gfx::PresentPlan &plan) {
+   std::string tvPath, drcPath;
++#ifdef __PROSPERO__
++  // PS5 DevLoop's `grab`: removing the request file is the check (one system call, which fails on
++  // every ordinary launch); the picture is the engine's own screenshot, a new file in its folder
++  if (R.frame % 4 == 0 && unlink("/app0/devloop-shot") == 0)
++    screenshot::request();
++  // ... and a test run's way out: the title quits as it would for a person
++  if (R.frame % 16 == 0 && unlink("/app0/devloop-quit") == 0) {
++    SDL_Event quit{};
++    quit.type = SDL_EVENT_QUIT;
++    SDL_PushEvent(&quit);
++  }
++#endif
+   if (!R.tv.scan || !R.tv.scan->image || !screenshot::take(R.frame + 1, tvPath, drcPath))
+     return;
+   auto shoot = [&](Screen &s, const std::string &path, bool tv) {
+@@ -2445,7 +2461,11 @@ void swap() {
+   }
+   set_present_plan(nullptr);
+   service_screenshots();  // this frame's: the submission that holds them
++#ifdef __cpp_lib_atomic_ref
+   std::atomic_ref<uint64_t>(R.frame).fetch_add(1);
++#else
++  __atomic_fetch_add(&R.frame, 1, __ATOMIC_SEQ_CST);
++#endif
+   R.completed = R.frame;
+ #ifdef __ANDROID__
+   if (tvScan) drivers::frame_done();
+@@ -3583,10 +3603,17 @@ static void test_fullscreen_key() {
+ // Closing the TV window ends the game. SDL only sends SDL_EVENT_QUIT once every window is closed, so
+ // with the GamePad window open the close button of the TV window did nothing. Closing the GamePad
+ // window only hides it (WWHD_NO_GAMEPAD=1 starts without it).
++#ifdef __PROSPERO__
++extern "C" void catchReturnFromMain(int status);
++#endif
+ static void quit_game() {
+   audio::finish_dump();  // _Exit bypasses atexit handlers
+   screenshot::finish();  // the screenshots taken are written first
+   gx2::checkpoint_vulkan_caches();
++#ifdef __PROSPERO__
++  // PlayStation 5: a title never exits; it asks the shell to close it (ps5/src/platform.c)
++  catchReturnFromMain(0);
++#endif
+   std::_Exit(0);
+ }
+ static bool close_request(const SDL_Event& event) {
+diff --git a/runtime/src/gfx/vulkan/overlay_sdl.cpp b/runtime/src/gfx/vulkan/overlay_sdl.cpp
+index 58d5039..0f8d8e8 100644
+--- a/runtime/src/gfx/vulkan/overlay_sdl.cpp
++++ b/runtime/src/gfx/vulkan/overlay_sdl.cpp
+@@ -207,6 +207,15 @@ void load_saved_options() {
+     }
+     auto saved = [&](const char* key, std::initializer_list<const char*> env) { return !env_set(env) && v.count(key); };
+     auto num = [&](const char* key) { return atof(v[key].c_str()); };
++#ifdef __PROSPERO__
++    // PlayStation 5, first start (nothing saved yet): three times the internal resolution at the
++    // game's own 30 fps, the best picture that held full speed where it was measured (the first
++    // island's pier, 5,100 draws a frame, 2026-10-11: 30.0 frames and 30.0 logic steps a second, the
++    // render thread idle half of each frame). 60 fps (frame interpolation) is the player's to turn
++    // on: it held in light scenes and ran that one at half speed, at every resolution, because the
++    // game thread and the render thread together need more than a sixtieth of a second for it.
++    if (!v.count("resScale") && !env_set({"WWHD_RES_SCALE"})) gfxvk::set_res_scale(3.0f);
++#endif
+     if (saved("resScale", {"WWHD_RES_SCALE"})) gfxvk::set_res_scale((float)num("resScale"));
+     if (saved("aoMode", {"WWHD_AO_MODE", "WWHD_NO_AO_QUIRK"})) gfxvk::set_ao_mode((int)num("aoMode"));
+     if (saved("aoHires", {"WWHD_AO_HIRES"})) gfxvk::set_ao_hires(num("aoHires") != 0);
+diff --git a/runtime/src/hle/swkbd.cpp b/runtime/src/hle/swkbd.cpp
+index 1b20355..1c372a9 100644
+--- a/runtime/src/hle/swkbd.cpp
++++ b/runtime/src/hle/swkbd.cpp
+@@ -10,6 +10,13 @@
+ #include "../overlay/text_entry.h"
+ #include "../runtime.h"
+ 
++#ifdef __PROSPERO__
++#include <functional>
++#include <string>
++bool ps5_ime_prompt(const std::u16string& initial, const std::u16string& hint, int max_len, int mode,
++                    std::function<void(bool, std::u16string)> done);
++#endif
++
+ namespace {
+ 
+ constexpr int kMaxForm = 4096;      // 16-bit characters
+@@ -103,6 +110,10 @@ void start_prompt() {
+         S.pending_ok = ok;
+         S.pending = true;
+     };
++#ifdef __PROSPERO__
++    // PlayStation 5: the console's own keyboard (ps5/src/ime_ps5.cpp); the overlay's if it cannot open
++    if (ps5_ime_prompt(S.text, S.hint, S.max_len, S.mode, done)) return;
++#endif
+     text_entry::Request r;
+     r.initial = S.text;
+     r.hint = S.hint;
+diff --git a/runtime/src/input_map.cpp b/runtime/src/input_map.cpp
+index a12f7db..a449b56 100644
+--- a/runtime/src/input_map.cpp
++++ b/runtime/src/input_map.cpp
+@@ -183,7 +183,15 @@ Mapping Mapping::defaults() {
+         kPadNone,  // Screenshot: no controller input by default (every button already plays)
+     };
+     for (int a = 0; a < kActionCount; a++) m.pad[a] = pads[a];
++#ifdef __PROSPERO__
++    // PlayStation 5: Cross confirms and Circle goes back, as everywhere on the console (the
++    // by-label preset; Controls > Face buttons has the Wii U's positions). The touchpad button,
++    // this host's Home input, opens Settings and is not the game's HOME.
++    m.pad[kHome] = kPadNone;
++    apply_face_layout(m, FaceLayout::kLabels);
++#else
+     apply_face_layout(m, FaceLayout::kPosition);
++#endif
+     return m;
+ }
+ 
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 0deb727..9008334 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -83,11 +83,11 @@ static void crash_handler(int sig, siginfo_t* si, void* uctx) {
+     uintptr_t base = (uintptr_t)PPC_MEM_BASE;
+     char path[96];
+     {
+-        mkdir("captures", 0755);
++        mkdir(WWHD_CAPTURES, 0755);
+         time_t t = time(nullptr);
+         struct tm tmv;
+         localtime_r(&t, &tmv);
+-        strftime(path, sizeof path, "captures/crash-%Y%m%d-%H%M%S.log", &tmv);
++        strftime(path, sizeof path, WWHD_CAPTURES "/crash-%Y%m%d-%H%M%S.log", &tmv);
+         g_crash_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+     }
+     const int fd = g_crash_fd;
+@@ -181,9 +181,9 @@ static void win_crash_out(int fd, const char* s, size_t n) { crash_context::reda
+ static void win_crash_log_only(int fd, const char* s, size_t n) { crash_context::redact(fd, {s,n}, win_crash_log_raw); }
+ static LONG WINAPI crash_handler(EXCEPTION_POINTERS* ex) {
+     auto code=ex->ExceptionRecord->ExceptionCode;
+-    std::error_code ec; std::filesystem::create_directories("captures",ec);
++    std::error_code ec; std::filesystem::create_directories(WWHD_CAPTURES,ec);
+     char path[96]; time_t t=time(nullptr); struct tm tmv; localtime_s(&tmv,&t);
+-    strftime(path,sizeof path,"captures/crash-%Y%m%d-%H%M%S.log",&tmv);
++    strftime(path,sizeof path,WWHD_CAPTURES "/crash-%Y%m%d-%H%M%S.log",&tmv);
+     int fd=_open(path,_O_WRONLY|_O_CREAT|_O_TRUNC|_O_BINARY,_S_IREAD|_S_IWRITE);
+     char buf[256]; int n;
+     // the module holding the faulting instruction (issue #41: a driver or an overlay's Vulkan layer)
+@@ -329,12 +329,12 @@ static void start_log_file(bool error = false) {
+     const char* overlay_trace = getenv("WWHD_OVERLAY_TRACE");
+     const bool tracing_overlay = overlay_trace && !strcmp(overlay_trace,"1");
+     if (!(e && *e) && !tracing_overlay && !(hostui::get("logFile", saved) && saved == "1")) return;
+-    std::string path = chosen ? e : "captures/wwhd.log";
++    std::string path = chosen ? e : WWHD_CAPTURES "/wwhd.log";
+     std::error_code ec;
+     if (!chosen) {
+-        std::filesystem::create_directories("captures", ec);
+-        std::filesystem::remove("captures/wwhd-previous.log", ec);
+-        std::filesystem::rename(path, "captures/wwhd-previous.log", ec);
++        std::filesystem::create_directories(WWHD_CAPTURES, ec);
++        std::filesystem::remove(WWHD_CAPTURES "/wwhd-previous.log", ec);
++        std::filesystem::rename(path, WWHD_CAPTURES "/wwhd-previous.log", ec);
+     }
+ #ifdef _WIN32
+     g_log_fd = _open(path.c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+@@ -348,6 +348,9 @@ static void start_log_file(bool error = false) {
+ }
+ 
+ extern "C" void synthetic_game_frame(Cpu*, PpcFunc);
++#ifdef __PROSPERO__
++extern "C" void catchReturnFromMain(int status);
++#endif
+ 
+ int main(int argc, char** argv) {
+     mods::code::startup(argc, argv);
+@@ -386,10 +389,20 @@ int main(int argc, char** argv) {
+             fclose(f);
+         }
+     }
++#endif
++#ifdef __PROSPERO__
++    // PlayStation 5: a title has no command line and no working directory. The game is in the
++    // title's own folder; /app0/env.txt (ps5/src/startup.c) carries options.
++    config::game_dir = "/app0/game";
++    config::save_dir = "/app0/userdata/save";
++    ps5_fp_ieee();
+ #endif
+     bool warm_shaders = false;
+ #ifdef WWHD_HAS_VULKAN
+     bool renderer_smoke = false;
++#ifdef __PROSPERO__
++    if (const char* smoke = getenv("WWHD_PS5_RENDERER_SMOKE"); smoke && *smoke && strcmp(smoke, "0")) renderer_smoke = true;
++#endif
+ #ifdef __ANDROID__
+     bool display_smoke = false;
+ #endif
+@@ -528,6 +541,9 @@ int main(int argc, char** argv) {
+     std::thread([] {
+         threads::run_main(mod, 1, args);
+         LOG("[boot] game main thread returned");
++#ifdef __PROSPERO__
++        catchReturnFromMain(0);  // a title never exits: it asks the shell to close it
++#endif
+         std::exit(0);
+     }).detach();
+     render::run_main_loop();
+diff --git a/runtime/src/platform/host.h b/runtime/src/platform/host.h
+index 7787a3f..9590382 100644
+--- a/runtime/src/platform/host.h
++++ b/runtime/src/platform/host.h
+@@ -28,6 +28,10 @@
+ #include <sys/resource.h>
+ #include <sys/syscall.h>
+ #endif
++#ifdef __PROSPERO__
++extern "C" void ps5_fp_ieee(void);  // ps5platform/fp.h
++extern "C" void ps5_sampler_thread(const char* name);
++#endif
+ namespace host {
+ #if defined(__APPLE__) && defined(WWHD_HAS_VULKAN)
+ // Render command batches can create Objective-C temporaries inside MoltenVK.
+@@ -54,6 +58,12 @@ inline void set_thread_name(const char* name) {
+  using SetDescription=HRESULT(WINAPI*)(HANDLE,PCWSTR);
+  auto f=(SetDescription)GetProcAddress(GetModuleHandleW(L"Kernel32.dll"),"SetThreadDescription");
+  if(f) { std::wstring text; for(unsigned char c:thread_label)text.push_back(c); f(GetCurrentThread(),text.c_str()); }
++#elif defined(__PROSPERO__)
++ // PlayStation 5: the label alone (get_thread_name reads it). Every thread of the runtime names
++ // itself first: a title's threads start with denormals flushed to zero, and the recompiled code
++ // needs IEEE arithmetic.
++ ps5_fp_ieee();
++ ps5_sampler_thread(name);  // WWHD_PS5_SAMPLE (ps5/src/sampler_ps5.cpp); nothing without it
+ #else
+  pthread_setname_np(pthread_self(),thread_label.substr(0,15).c_str());
+ #endif
+@@ -77,6 +87,8 @@ inline void boost_thread_priority() {
+   PowerThrottling state{1 /* THREAD_POWER_THROTTLING_CURRENT_VERSION */,1 /* EXECUTION_SPEED */,0 /* off */};
+   set_info(GetCurrentThread(),3 /* ThreadPowerThrottling */,&state,sizeof state);
+  }
++#elif defined(__PROSPERO__)
++ // PlayStation 5: a title's threads are not reprioritised this way
+ #else
+  setpriority(PRIO_PROCESS,(id_t)syscall(SYS_gettid),-5);  // EPERM without CAP_SYS_NICE: ignored
+ #endif
+@@ -102,6 +114,8 @@ inline uintptr_t executable_base() {
+ inline std::string executable_path() {
+ #ifdef _WIN32
+  char path[32768]; DWORD n=GetModuleFileNameA(nullptr,path,sizeof path);return std::string(path,n);
++#elif defined(__PROSPERO__)
++ return "/app0/eboot.bin";  // PlayStation 5: a title's own folder is mounted at /app0
+ #elif !defined(__APPLE__)
+  char path[4096];ssize_t n=readlink("/proc/self/exe",path,sizeof path);return n>0?std::string(path,n):std::string();
+ #else
+@@ -153,6 +167,8 @@ inline std::string exe_dir() {
+   if(_NSGetExecutablePath(buf,&n)==0){ char real[PATH_MAX]; p=realpath(buf,real)?real:buf; }
+ #elif defined(_WIN32)
+   char buf[MAX_PATH*4]; DWORD n=GetModuleFileNameA(nullptr,buf,sizeof buf); if(n>0&&n<sizeof buf) p.assign(buf,n);
++#elif defined(__PROSPERO__)
++  p="/app0/eboot.bin";
+ #else
+   char buf[4096]; ssize_t n=readlink("/proc/self/exe",buf,sizeof buf-1); if(n>0) p.assign(buf,(size_t)n);
+ #endif
+diff --git a/runtime/src/platform/input_sdl.cpp b/runtime/src/platform/input_sdl.cpp
+index d1f200f..fd2ef3c 100644
+--- a/runtime/src/platform/input_sdl.cpp
++++ b/runtime/src/platform/input_sdl.cpp
+@@ -575,7 +575,15 @@ void update(){
+   auto button=[&](SDL_GamepadButton b,int p){put(p,SDL_GetGamepadButton(pad,b)?1.f:0.f);};
+   button(SDL_GAMEPAD_BUTTON_SOUTH,kPadA);button(SDL_GAMEPAD_BUTTON_EAST,kPadB);button(SDL_GAMEPAD_BUTTON_WEST,kPadX);button(SDL_GAMEPAD_BUTTON_NORTH,kPadY);
+   button(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,kPadLB);button(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER,kPadRB);
+-  button(SDL_GAMEPAD_BUTTON_START,kPadMenu);button(SDL_GAMEPAD_BUTTON_BACK,kPadOptions);button(SDL_GAMEPAD_BUTTON_GUIDE,kPadHome);
++  button(SDL_GAMEPAD_BUTTON_START,kPadMenu);
++#ifdef __PROSPERO__
++  // PlayStation 5: the touchpad button (the pad driver's Back) opens and closes Settings, as Home
++  // does elsewhere: the PS button is the console's, and the game's Minus only switches a Wii U to
++  // its GamePad's screen, which a console with one screen has no use for
++  button(SDL_GAMEPAD_BUTTON_BACK,kPadHome);
++#else
++  button(SDL_GAMEPAD_BUTTON_BACK,kPadOptions);button(SDL_GAMEPAD_BUTTON_GUIDE,kPadHome);
++#endif
+   button(SDL_GAMEPAD_BUTTON_LEFT_STICK,kPadL3);button(SDL_GAMEPAD_BUTTON_RIGHT_STICK,kPadR3);
+   button(SDL_GAMEPAD_BUTTON_DPAD_UP,kPadDUp);button(SDL_GAMEPAD_BUTTON_DPAD_DOWN,kPadDDown);button(SDL_GAMEPAD_BUTTON_DPAD_LEFT,kPadDLeft);button(SDL_GAMEPAD_BUTTON_DPAD_RIGHT,kPadDRight);
+   put(kPadLT,std::max(0.f,SDL_GetGamepadAxis(pad,SDL_GAMEPAD_AXIS_LEFT_TRIGGER)/32767.f));put(kPadRT,std::max(0.f,SDL_GetGamepadAxis(pad,SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)/32767.f));
+@@ -752,7 +760,14 @@ static void apply_scenario(PadState& s) {
+         if (t >= p.from && t < p.to) s.buttons |= p.bits;
+ }
+ 
++#ifdef __PROSPERO__
++// PlayStation 5: the pad acts as a Wii U Pro Controller unless told otherwise (WWHD_PRO_CONTROLLER=0,
++// Controls): with it the game shows its pause menu, inventory and maps on the TV. As a GamePad it
++// puts them on the GamePad's screen, which a console with one screen does not have.
++static std::atomic<bool> g_pro{[] { const char* e = getenv("WWHD_PRO_CONTROLLER"); return !e || strcmp(e, "0") != 0; }()};
++#else
+ static std::atomic<bool> g_pro{getenv("WWHD_PRO_CONTROLLER") != nullptr};
++#endif
+ bool pro_controller() { return g_pro.load(std::memory_order_relaxed); }
+ void set_pro_controller(bool on) { g_pro = on; LOG("[input] keyboard/controller act as %s", on ? "Pro Controller" : "GamePad"); }
+ 
+diff --git a/runtime/src/runtime.h b/runtime/src/runtime.h
+index 9443713..5421a87 100644
+--- a/runtime/src/runtime.h
++++ b/runtime/src/runtime.h
+@@ -9,6 +9,14 @@
+ #include "ppc.h"
+ #include "exception_report.h"
+ 
++// Where logs, crash reports and frame captures go: relative to the working directory, except on the
++// PlayStation 5, where a title has none.
++#ifdef __PROSPERO__
++#define WWHD_CAPTURES "/app0/userdata/captures"
++#else
++#define WWHD_CAPTURES "captures"
++#endif
++
+ // ---- guest memory layout ----
+ namespace mem {
+ constexpr uint32_t kMem2Start = 0x10000000;   // app data + heap (MEM2)
+diff --git a/runtime/src/threads.cpp b/runtime/src/threads.cpp
+index 00a77fc..89eb3d5 100644
+--- a/runtime/src/threads.cpp
++++ b/runtime/src/threads.cpp
+@@ -97,6 +97,9 @@ struct HostThread {
+     HANDLE pt = nullptr;
+ #else
+     pthread_t pt{};
++#endif
++#ifdef __PROSPERO__
++    void* ps5_stack = nullptr;  // the host stack, from direct memory (ps5/src/guestmem_ps5.cpp)
+ #endif
+     // scheduling
+     int prio = 16;            // lower runs first; service threads (alarms, audio) use -1
+@@ -493,7 +496,8 @@ __attribute__((noinline)) static void try_entry_park(HostThread* t, Cpu* c) {
+         if (!g_frozen || t == g_frz_owner) return;
+     }
+     if (mode == 2 && (!t->has_target || c->r[1] != t->tgt_r1 || c->lr != t->tgt_lr)) return;
+-#ifdef _WIN32
++#if defined(_WIN32) || defined(__PROSPERO__)
++    // (PlayStation 5: a title has no dladdr to classify host frames with either)
+     // Entry parking requires host-frame symbol classification; Windows stack unwinding needs
+     // a dedicated implementation. Ordinary waits remain saveable; never guess a safe frame.
+     return;
+@@ -596,6 +600,13 @@ void service_end() {
+ }
+ }  // namespace threads
+ 
++#ifdef __PROSPERO__
++// PlayStation 5: libkernel takes a stack this large from the title's small flexible budget
++extern "C" void* ps5_thread_stack_take(size_t bytes);
++extern "C" void ps5_thread_stack_give(void* base, size_t bytes);
++static constexpr size_t kPs5StackBytes = 64 << 20;
++#endif
++
+ static void* thread_main(void* p) {
+     HostThread* ht = (HostThread*)p;
+     t_self = ht;
+@@ -633,6 +644,9 @@ static void* thread_main(void* p) {
+     }
+     ht->cv.notify_all();
+     TRACE("[thread] %s exited with %08X", name.c_str(), rv);
++#ifdef __PROSPERO__
++    if (ht->ps5_stack) ps5_thread_stack_give(ht->ps5_stack, kPs5StackBytes);
++#endif
+     return nullptr;
+ }
+ 
+@@ -646,8 +660,15 @@ static void start_host_thread(HostThread* ht) {
+ #else
+     pthread_attr_t attr;
+     pthread_attr_init(&attr);
++#ifdef __PROSPERO__
++    ht->ps5_stack = ps5_thread_stack_take(kPs5StackBytes);
++    if (!ht->ps5_stack) fatal("cannot allocate a guest thread's stack");
++    pthread_attr_setstack(&attr, ht->ps5_stack, kPs5StackBytes);
++    if (int error = pthread_create(&ht->pt, &attr, thread_main, ht)) fatal("cannot create guest thread (error=%d)", error);
++#else
+     pthread_attr_setstacksize(&attr, 64 << 20);  // deep guest call chains recurse on the host stack
+     pthread_create(&ht->pt, &attr, thread_main, ht);
++#endif
+     pthread_attr_destroy(&attr);
+ #endif
+ }
+diff --git a/runtime/src/true60.cpp b/runtime/src/true60.cpp
+index 0f6d623..5c56504 100644
+--- a/runtime/src/true60.cpp
++++ b/runtime/src/true60.cpp
+@@ -766,8 +766,8 @@ extern "C" void hook_025DF940(Cpu* c) {
+             static int logged = 0;
+             if (logged++ < 20) {
+                 std::error_code directory_error;
+-                std::filesystem::create_directory("captures", directory_error);
+-                if (FILE* f = fopen("captures/true60-nan.log", "a")) {
++                std::filesystem::create_directory(WWHD_CAPTURES, directory_error);
++                if (FILE* f = fopen(WWHD_CAPTURES "/true60-nan.log", "a")) {
+                     fprintf(f, "pass %llu: 60 Hz camera step produced NaN (sphere %d, caller %08X); restored, 30 Hz for 60 passes\n",
+                             (unsigned long long)g_pass, (int)g_cam_nan, g_cam_nan_lr);
+                     for (uint32_t o = kDCamera; o < kCamSnap; o += 4) {
+diff --git a/runtime/src/true60_test.cpp b/runtime/src/true60_test.cpp
+index e2d0ee0..fdb699f 100644
+--- a/runtime/src/true60_test.cpp
++++ b/runtime/src/true60_test.cpp
+@@ -40,6 +40,7 @@
+ #include "savestate.h"
+ #include "input.h"
+ #include "input_map.h"
++#include "platform/host.h"
+ 
+ namespace interp { uint64_t logic_steps(); uint64_t pass_count(); bool hold_pass(); }
+ 
+@@ -573,7 +574,11 @@ void wp_handler(int sig, siginfo_t* si, void* uc) {
+     uintptr_t a = (uintptr_t)si->si_addr;
+     if (a >= g_wp_lo && a < g_wp_hi) {
+         char name[64] = "";
++#ifdef __PROSPERO__
++        host::get_thread_name(name, sizeof name);
++#else
+         pthread_getname_np(pthread_self(), name, sizeof name);
++#endif
+         Cpu* c = threads::current();
+         char buf[200];
+         int n = snprintf(buf, sizeof buf, "[wp] write %08X by \"%s\" guest lr=%08X\n", (unsigned)(a - (uintptr_t)PPC_MEM_BASE), name,
+@@ -641,7 +646,9 @@ extern "C" void hook_02753D6C(Cpu* c) {
+         std::lock_guard<std::mutex> lk(m);
+         if (seen.insert({h, t}).second) {
+             char name[64] = "";
+-#ifndef _WIN32
++#ifdef __PROSPERO__
++            host::get_thread_name(name, sizeof name);
++#elif !defined(_WIN32)
+             pthread_getname_np(pthread_self(), name, sizeof name);
+ #endif
+             LOG("[heaplog] heap %08X (flags %08X, %08X..%08X) first alloc by \"%s\" (%08X) size %X lr %08X", h, ld32(h + 0x90),
+diff --git a/runtime/src/write_watch.cpp b/runtime/src/write_watch.cpp
+index 201e5f4..985bd06 100644
+--- a/runtime/src/write_watch.cpp
++++ b/runtime/src/write_watch.cpp
+@@ -16,6 +16,10 @@
+ #include <sys/mman.h>
+ #endif
+ 
++#ifdef __PROSPERO__
++extern "C" bool ps5_guest_fault(void*);
++#endif
++
+ namespace wwatch {
+ namespace {
+ 
+@@ -89,6 +93,10 @@ struct sigaction g_old_segv, g_old_bus;
+ void handler(int sig, siginfo_t* si, void* uc) {
+     // macOS reports a write to a read-only page as SIGBUS, Linux/Android as SIGSEGV
+     if (on_write_fault((uintptr_t)si->si_addr)) return;
++#ifdef __PROSPERO__
++    // PlayStation 5: a hole of the guest address space, backed on demand (ps5/src/guestmem_ps5.cpp)
++    if (ps5_guest_fault(si->si_addr)) return;
++#endif
+     // not ours: the crash handler (main.cpp) or whatever was installed before
+     struct sigaction& o = sig == SIGBUS ? g_old_bus : g_old_segv;
+     if (o.sa_flags & SA_SIGINFO) o.sa_sigaction(sig, si, uc);
+diff --git a/tools/recomp/hooks_ps5.txt b/tools/recomp/hooks_ps5.txt
+new file mode 100644
+index 0000000..9380fa7
+--- /dev/null
++++ b/tools/recomp/hooks_ps5.txt
+@@ -0,0 +1,2 @@
++# PlayStation 5 (ps5/src/controller_ps5.cpp). @ADDR = instruction hook.
++@02618094 # ControllerMgr: set the controller mode (r4: 0 Pro Controller, 1 or 2 GamePad, 3 both): entry
