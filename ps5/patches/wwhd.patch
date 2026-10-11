@@ -1,8 +1,8 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 4ae364f..7baa021 100644
+index 4ae364f..4a06f25 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -141,6 +141,11 @@ elseif(ANDROID)
+@@ -141,6 +141,12 @@ elseif(ANDROID)
    list(APPEND RUNTIME_SOURCES runtime/src/platform/https_android.cpp)
  elseif(WIN32)
    list(APPEND RUNTIME_SOURCES runtime/src/platform/https_win.cpp)
@@ -10,11 +10,12 @@ index 4ae364f..7baa021 100644
 +  # PlayStation 5: no downloads (the catalogue of mods is not reachable from a title)
 +  list(APPEND RUNTIME_SOURCES ${PS5_PORT_DIR}/ps5/src/https_ps5.cpp ${PS5_PORT_DIR}/ps5/src/guestmem_ps5.cpp
 +       ${PS5_PORT_DIR}/ps5/src/ime_ps5.cpp ${PS5_PORT_DIR}/ps5/src/sampler_ps5.cpp
-+       ${PS5_PORT_DIR}/ps5/src/controller_ps5.cpp ${PS5_PORT_DIR}/ps5/src/threads_ps5.cpp)
++       ${PS5_PORT_DIR}/ps5/src/controller_ps5.cpp ${PS5_PORT_DIR}/ps5/src/threads_ps5.cpp
++       ${PS5_PORT_DIR}/ps5/src/glyphs_ps5.cpp)
  elseif(UNIX AND NOT ANDROID)
    # libcurl is loaded at run time (dlopen); only its headers are needed. They are copied on their own:
    # their directory (e.g. /usr/include/x86_64-linux-gnu) also holds the system's glibc headers, which
-@@ -204,7 +209,7 @@ if(NOT TARGET ZLIB::ZLIB)
+@@ -204,7 +210,7 @@ if(NOT TARGET ZLIB::ZLIB)
    find_package(ZLIB REQUIRED)
  endif()
  find_package(Threads REQUIRED)
@@ -464,10 +465,36 @@ index 58d5039..42c5d84 100644
      if (saved("aoMode", {"WWHD_AO_MODE", "WWHD_NO_AO_QUIRK"})) gfxvk::set_ao_mode((int)num("aoMode"));
      if (saved("aoHires", {"WWHD_AO_HIRES"})) gfxvk::set_ao_hires(num("aoHires") != 0);
 diff --git a/runtime/src/gfx/vulkan/surfaces.cpp b/runtime/src/gfx/vulkan/surfaces.cpp
-index 79dcd53..8e4c017 100644
+index 79dcd53..91f3e18 100644
 --- a/runtime/src/gfx/vulkan/surfaces.cpp
 +++ b/runtime/src/gfx/vulkan/surfaces.cpp
-@@ -1206,6 +1206,9 @@ void clear_color(const uint32_t*,uint32_t cb,const float rgba[4]) {
+@@ -1107,6 +1107,15 @@ static uint32_t mip_base(Surface* s,uint32_t level) {
+     cached.address=address;cached.addressValid=true;
+     return cached.address;
+ }
++#ifdef __PROSPERO__
++// ps5/src/glyphs_ps5.cpp: a level of a texture as the game has it, on its way to the GPU
++void ps5_texture(uint64_t hash,uint32_t level,uint32_t vkFormat,bool compressed,uint32_t guestFormat,
++                 std::vector<uint8_t>& data,uint32_t w,uint32_t h,uint32_t slices);
++static void ps5_texture_level(Surface* s,uint32_t level,uint64_t hash,std::vector<uint8_t>& data,uint32_t w,uint32_t h,uint32_t slices) {
++    if(s->fmt.depth||s->fmt.stencil)return;
++    ps5_texture(hash,level,uint32_t(s->fmt.pixel),s->fmt.compressed,s->format,data,w,h,slices);
++}
++#endif
+ void upload_surface(Surface* s) {
+     if(!s||!s->image||s->gpuWritten)return;
+     // All callers, including render attachments, share the once-per-frame
+@@ -1150,6 +1159,9 @@ void upload_surface(Surface* s) {
+     end_encoder();transition_image(s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
+     for(uint32_t level=0;level<s->mips;++level) {
+         std::vector<uint8_t> data;uint32_t w,h,slices;decode_level(s,level,mip_base(s,level),data,w,h,slices);
++#ifdef __PROSPERO__
++        ps5_texture_level(s,level,hash,data,w,h,slices);  // button glyphs (ps5/src/glyphs_ps5.cpp)
++#endif
+         if (s->bcDecoded) { bc_decode_upload(s,level,data,w,h,slices); continue; }
+         std::vector<VkBufferImageCopy> copies;std::vector<uint8_t> packed;
+         bool threeD=s->imageType==VK_IMAGE_TYPE_3D;
+@@ -1206,6 +1218,9 @@ void clear_color(const uint32_t*,uint32_t cb,const float rgba[4]) {
  }
  void clear_depth_stencil(const uint32_t*,uint32_t db,float depth,uint32_t stencil,uint32_t flags) {
      uint32_t first,num;auto* s=surface_from_depth_buffer(db,&first,&num);if(!s)return;
@@ -477,7 +504,7 @@ index 79dcd53..8e4c017 100644
      VkImageAspectFlags aspects=0;if(flags&1)aspects|=VK_IMAGE_ASPECT_DEPTH_BIT;if((flags&2)&&s->fmt.stencil)aspects|=VK_IMAGE_ASPECT_STENCIL_BIT;
      if(!aspects)return;
      end_encoder();transition_image(s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
-@@ -1383,6 +1386,9 @@ void copy_surface(uint32_t src,uint32_t srcMip,uint32_t srcSlice,uint32_t dst,ui
+@@ -1383,6 +1398,9 @@ void copy_surface(uint32_t src,uint32_t srcMip,uint32_t srcSlice,uint32_t dst,ui
      copy_surface_impl(src,srcMip,srcSlice,dst,dstMip,dstSlice);
  }
  void invalidate(uint32_t flags,uint32_t addr,uint32_t size) {
@@ -833,6 +860,38 @@ index d1f200f..fd2ef3c 100644
  bool pro_controller() { return g_pro.load(std::memory_order_relaxed); }
  void set_pro_controller(bool on) { g_pro = on; LOG("[input] keyboard/controller act as %s", on ? "Pro Controller" : "GamePad"); }
  
+diff --git a/runtime/src/rtl_text_hooks.cpp b/runtime/src/rtl_text_hooks.cpp
+index 84c86fe..dca2a53 100644
+--- a/runtime/src/rtl_text_hooks.cpp
++++ b/runtime/src/rtl_text_hooks.cpp
+@@ -48,6 +48,10 @@ void f_0286E8B4_orig(Cpu* c);  // CharWriter::PrintGlyph
+ void f_028785C8_orig(Cpu* c);  // lyt::TextBox::DrawSelf
+ }
+ 
++#ifdef __PROSPERO__
++uint32_t ps5_button_text(uint32_t text, int32_t& length);
++#endif
++
+ namespace rtl_text {
+ 
+ namespace {
+@@ -252,6 +256,16 @@ extern "C" void hook_02871328(Cpu* c) {
+ 
+ // TextWriterBase<wchar_t>::PrintImpl (r3 = writer, r4 = text, r5 = length; returns the width in f1)
+ extern "C" void hook_028709E0(Cpu* c) {
++#ifdef __PROSPERO__
++    {
++        // PlayStation 5: a button's name is printed as the DualSense's (ps5/src/glyphs_ps5.cpp)
++        int32_t n = (int32_t)c->r[5];
++        if (c->r[4] && n >= 1 && n <= 2) {
++            c->r[4] = ps5_button_text(c->r[4], n);
++            c->r[5] = (uint32_t)n;
++        }
++    }
++#endif
+     if (!g_on.load(std::memory_order_acquire)) return f_028709E0_orig(c);
+     const uint32_t writer = c->r[3], text = c->r[4];
+     const int32_t len = (int32_t)c->r[5];
 diff --git a/runtime/src/runtime.h b/runtime/src/runtime.h
 index 9443713..5421a87 100644
 --- a/runtime/src/runtime.h
