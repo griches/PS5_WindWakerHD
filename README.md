@@ -134,7 +134,7 @@ cache, save states, screenshots and the game's saves are written to
 
 | DualSense | In the game |
 | --- | --- |
-| Cross / Circle / Square / Triangle | A / B / Y / X (Cross confirms, Circle goes back) |
+| Cross / Circle / Square / Triangle | B / A / Y / X: the Wii U's positions, so the prompts on screen sit where the buttons do (Circle confirms, Cross goes back) |
 | L1, R1, L2, R2 | L, R, ZL, ZR |
 | Options | + (the game's menu) |
 | Touchpad button | **Settings**: frame rate, internal resolution, aspect ratio, save states, controls |
@@ -142,8 +142,8 @@ cache, save states, screenshots and the game's saves are written to
 
 On the game's Controller Selection screen either choice plays the same way, as a
 Pro Controller. In Settings, the D-pad or left stick moves, Cross selects, Circle closes, and L1 / R1
-change tab. `Controls > Face buttons` has the Wii U's positions (Circle as A) if you
-prefer them. When the game asks for text, the console's keyboard opens.
+change tab. `Controls > Face buttons` has the by-label choice (Cross as A) if you
+prefer it; the prompts then show each symbol on the button it plays, away from its place on the pad. When the game asks for text, the console's keyboard opens.
 
 `/data/homebrew/PPSA99306/env.txt`, if you make one, holds upstream's `WWHD_`
 options, one `NAME=value` a line.

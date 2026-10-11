@@ -572,25 +572,23 @@ index 1b20355..1c372a9 100644
      r.initial = S.text;
      r.hint = S.hint;
 diff --git a/runtime/src/input_map.cpp b/runtime/src/input_map.cpp
-index a12f7db..a449b56 100644
+index a12f7db..65754ed 100644
 --- a/runtime/src/input_map.cpp
 +++ b/runtime/src/input_map.cpp
-@@ -183,7 +183,15 @@ Mapping Mapping::defaults() {
+@@ -183,6 +183,13 @@ Mapping Mapping::defaults() {
          kPadNone,  // Screenshot: no controller input by default (every button already plays)
      };
      for (int a = 0; a < kActionCount; a++) m.pad[a] = pads[a];
 +#ifdef __PROSPERO__
-+    // PlayStation 5: Cross confirms and Circle goes back, as everywhere on the console (the
-+    // by-label preset; Controls > Face buttons has the Wii U's positions). The touchpad button,
-+    // this host's Home input, opens Settings and is not the game's HOME.
++    // PlayStation 5: the touchpad button, this host's Home input, opens Settings and is not the
++    // game's HOME. The face buttons stay by position, so the game's prompts (A right, B below,
++    // X above, Y left) show the DualSense's symbols where the pad has them: Circle, Cross,
++    // Triangle, Square.
 +    m.pad[kHome] = kPadNone;
-+    apply_face_layout(m, FaceLayout::kLabels);
-+#else
-     apply_face_layout(m, FaceLayout::kPosition);
 +#endif
+     apply_face_layout(m, FaceLayout::kPosition);
      return m;
  }
- 
 diff --git a/runtime/src/interp.cpp b/runtime/src/interp.cpp
 index ce9aed0..3aa77d7 100644
 --- a/runtime/src/interp.cpp

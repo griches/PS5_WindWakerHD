@@ -11,8 +11,8 @@
  *      runtime/src/rtl_text_hooks.cpp). A text that is exactly one button's name is printed as
  *      one character the English game never prints (the font carries kana): A, B, X and Y as
  *      the one that stands for the DualSense button that plays that Wii U button (Controls > Face
- *      buttons decides: by default Cross is A, Circle B, Square X, Triangle Y), and R, ZR, L and
- *      ZL as the ones for R1, R2, L1 and L2.
+ *      buttons decides: by default, by position, Circle is A, Cross B, Triangle X and Square Y),
+ *      and R, ZR, L and ZL as the ones for R1, R2, L1 and L2.
  *   2. The font. When the renderer uploads that font's sheet (known by the hash of its bytes),
  *      those characters' cells are painted over: a cross, a circle, a square and a triangle drawn
  *      here in the font's own two tones (white, and the grey its outline is), and the shoulder
