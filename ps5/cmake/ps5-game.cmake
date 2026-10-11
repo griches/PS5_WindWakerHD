@@ -78,8 +78,10 @@ set(WWHD_RENDERER VULKAN CACHE STRING "" FORCE)
 # The link: every object and archive CMake would hand the linker goes to
 # PS5_Vulkan's recipe instead (RADV, the platform layer, the CRT, the fake SELF)
 set(CMAKE_CXX_LINK_EXECUTABLE
-	"bash ${ps5}/tools/link-title.sh ${CMAKE_BINARY_DIR} ${PS5_VULKAN_DIR} ${PS5_PAYLOAD_SDK} <OBJECTS> --whole-archive ${ps5_platform_archive} --no-whole-archive <LINK_LIBRARIES>")
-# (the start-up constructor in the platform archive has no caller: hence whole)
+	"bash ${ps5}/tools/link-title.sh ${CMAKE_BINARY_DIR} ${PS5_VULKAN_DIR} ${PS5_PAYLOAD_SDK} --whole-archive ${ps5_platform_archive} --no-whole-archive <OBJECTS> <LINK_LIBRARIES>")
+# (the start-up constructor in the platform archive has no caller: hence whole. And first: the
+# initialisers run in link order, and the runtime reads options from the environment in its own,
+# which /app0/env.txt must have filled by then)
 
 # The platform archive is named by its file in the link, so the game does not
 # depend on it by itself (the game's target exists once its CMakeLists.txt has run)

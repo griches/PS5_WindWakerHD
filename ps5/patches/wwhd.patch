@@ -78,11 +78,45 @@ index fbad62c..46b17c9 100644
      return mode == 0 ? current : mode == 2;
  }
  } // namespace ss
+diff --git a/runtime/src/gfx/vulkan/api.h b/runtime/src/gfx/vulkan/api.h
+index 0038a6d..ad4d4fb 100644
+--- a/runtime/src/gfx/vulkan/api.h
++++ b/runtime/src/gfx/vulkan/api.h
+@@ -24,6 +24,10 @@ void set_tv_format(uint32_t gx2Format, bool tv);
+ void invalidate(uint32_t flags, uint32_t addr, uint32_t size);
+ void flush();                    // drain: submit and wait (readbacks, tools)
+ void flush_async();              // GX2Flush: submit without waiting
++#ifdef __PROSPERO__
++void ps5_set_hold_pass(bool hold);   // the pass that follows is an in-between one (draw.cpp)
++void guest_flush();              // GX2Flush on the PlayStation 5: with the next submission (backend.cpp)
++#endif
+ void wait_idle();
+ void write_back_linear_targets();  // GX2DrawDone: linear render targets to guest memory (surfaces.cpp)
+ uint64_t frame_count();
 diff --git a/runtime/src/gfx/vulkan/backend.cpp b/runtime/src/gfx/vulkan/backend.cpp
-index 7ac593e..4dea30b 100644
+index 7ac593e..84523b5 100644
 --- a/runtime/src/gfx/vulkan/backend.cpp
 +++ b/runtime/src/gfx/vulkan/backend.cpp
-@@ -1022,7 +1022,11 @@ void wait_idle() {
+@@ -994,6 +994,18 @@ static void submit(VkSemaphore wait = VK_NULL_HANDLE,
+     activate_submission(R.activeSubmission);
+   }
+ }
++#ifdef __PROSPERO__
++// PlayStation 5: a submission is a system call of about 0.45 ms on this thread, whatever its size
++// (PS5_Mesa's radv_ps5_submit: sceAgcDriverSubmitDcb), and the game's GX2Flush and GX2DrawDone made
++// two of the five a frame. They only ask for the work to be started: here it goes with the next
++// submission (a draw batch, or the frame's end), and what reads results back waits for them itself.
++// WWHD_PS5_EAGER_FLUSH=1 submits at each, as elsewhere.
++void guest_flush() {
++  static const bool eager = [] { const char* e = getenv("WWHD_PS5_EAGER_FLUSH"); return e && *e && strcmp(e, "0") != 0; }();
++  ++ps5VertexInterval;  // the game may write its vertex buffers again (draw.cpp)
++  if (eager) flush_async();
++}
++#endif
+ void flush_async() {
+   // Deferred objects may reference earlier queued work even if this slot has
+   // no draw commands. Submit an empty command buffer to retire them in order.
+@@ -1022,7 +1034,11 @@ void wait_idle() {
  }
  void with_autorelease_pool(void (*fn)()) { host::with_autorelease_pool(fn); }
  uint64_t frames_completed() { return R.completed.load(); }
@@ -94,7 +128,7 @@ index 7ac593e..4dea30b 100644
  static bool has_extension(const std::vector<VkExtensionProperties> &es,
                            const char *name) {
    return std::any_of(es.begin(), es.end(),
-@@ -2217,7 +2221,7 @@ static void frame_dumps(uint64_t frame) {
+@@ -2217,7 +2233,7 @@ static void frame_dumps(uint64_t frame) {
    if (captureRequested.exchange(false) || frame == scripted) {
      char dir[64];
      time_t t = time(nullptr);
@@ -103,7 +137,7 @@ index 7ac593e..4dea30b 100644
      std::error_code ec;
      std::filesystem::create_directories(dir, ec);
      dump_scan(R.tv, std::string(dir) + "/tv.png");
-@@ -2246,6 +2250,18 @@ std::vector<Buffer> shotBuffersDone;
+@@ -2246,6 +2262,18 @@ std::vector<Buffer> shotBuffersDone;
  }  // namespace
  static void take_screenshots(const gfx::PresentPlan &plan) {
    std::string tvPath, drcPath;
@@ -122,7 +156,7 @@ index 7ac593e..4dea30b 100644
    if (!R.tv.scan || !R.tv.scan->image || !screenshot::take(R.frame + 1, tvPath, drcPath))
      return;
    auto shoot = [&](Screen &s, const std::string &path, bool tv) {
-@@ -2445,7 +2461,11 @@ void swap() {
+@@ -2445,7 +2473,11 @@ void swap() {
    }
    set_present_plan(nullptr);
    service_screenshots();  // this frame's: the submission that holds them
@@ -134,7 +168,7 @@ index 7ac593e..4dea30b 100644
    R.completed = R.frame;
  #ifdef __ANDROID__
    if (tvScan) drivers::frame_done();
-@@ -3583,10 +3603,17 @@ static void test_fullscreen_key() {
+@@ -3583,10 +3615,17 @@ static void test_fullscreen_key() {
  // Closing the TV window ends the game. SDL only sends SDL_EVENT_QUIT once every window is closed, so
  // with the GamePad window open the close button of the TV window did nothing. Closing the GamePad
  // window only hides it (WWHD_NO_GAMEPAD=1 starts without it).
@@ -152,6 +186,263 @@ index 7ac593e..4dea30b 100644
    std::_Exit(0);
  }
  static bool close_request(const SDL_Event& event) {
+diff --git a/runtime/src/gfx/vulkan/backend.h b/runtime/src/gfx/vulkan/backend.h
+index bf3841c..d4fd538 100644
+--- a/runtime/src/gfx/vulkan/backend.h
++++ b/runtime/src/gfx/vulkan/backend.h
+@@ -192,6 +192,14 @@ void save_pipeline_cache();
+ // Only guest GX2Flush uses this asynchronous path. flush() remains a drain for
+ // readbacks and renderer tools; final presentation also waits synchronously.
+ void flush_async();
++#ifdef __PROSPERO__
++void guest_flush();
++// draw.cpp: the vertex copies of one GX2DrawDone interval (guest_flush ends it)
++extern uint64_t ps5VertexInterval;
++void ps5_vertex_invalidate(uint32_t addr, uint32_t size);
++// draw.cpp: on an in-between pass, the shadow maps' depth target (which is not drawn again)
++bool ps5_skip_shadow_target(uint32_t depthAddress);
++#endif
+ void reset_pipeline_lookup_cache();
+ uint64_t draw_batch_submissions();
+ void vk_check(VkResult result,const char* operation);
+diff --git a/runtime/src/gfx/vulkan/backend_table.cpp b/runtime/src/gfx/vulkan/backend_table.cpp
+index c35350b..4598941 100644
+--- a/runtime/src/gfx/vulkan/backend_table.cpp
++++ b/runtime/src/gfx/vulkan/backend_table.cpp
+@@ -57,7 +57,11 @@ const Backend& vulkan_backend() {
+         b.with_autorelease_pool = gfxvk::with_autorelease_pool;
+         b.set_tv_format = gfxvk::set_tv_format;
+         b.invalidate = gfxvk::invalidate;
++#ifdef __PROSPERO__
++        b.guest_flush = gfxvk::guest_flush;  // lazy: backend.cpp
++#else
+         b.guest_flush = gfxvk::flush_async;
++#endif
+         b.wait_idle = gfxvk::wait_idle;
+         b.write_back = gfxvk::write_back_linear_targets;
+         b.ss_reset = [] {
+diff --git a/runtime/src/gfx/vulkan/draw.cpp b/runtime/src/gfx/vulkan/draw.cpp
+index 0f676e1..0ccdbd8 100644
+--- a/runtime/src/gfx/vulkan/draw.cpp
++++ b/runtime/src/gfx/vulkan/draw.cpp
+@@ -18,7 +18,12 @@
+ #include "index_conversion.h"
+ #include "vertex_history.h"
+ #include "vertex_snapshot_history.h"
++#include "write_watch.h"
++#include "gx2/gx2.h"
+ #include <algorithm>
++#include <map>
++#include <tuple>
++#include <vector>
+ #include <array>
+ #include <cmath>
+ #include <chrono>
+@@ -41,6 +46,11 @@ bool preparation_stats_enabled() {
+ // Bounded overlap: the default on every platform (measured on macOS and Windows); an explicit
+ // zero/invalid WWHD_VK_DRAW_BATCH disables it.
+ uint32_t parse_draw_batch(const char* text) {
++#ifdef __PROSPERO__
++  // PlayStation 5: a submission costs this thread about 0.45 ms (backend.cpp, guest_flush), and
++  // the GPU never kept the frame waiting: one mid-frame submission for a 5,000-draw frame, not two
++  if (!text) return 4096;
++#endif
+   if (!text) return 2048;
+   if (!*text) return 0;
+   uint32_t value = 0;
+@@ -131,6 +141,84 @@ UploadSlice snapshot(const void *data, size_t size, VkDeviceSize alignment) {
+   return slice;
+ }
+ 
++#ifdef __PROSPERO__
++// PlayStation 5: one copy of a vertex range for each GX2DrawDone interval.
++//
++// The buffers that are rewritten every frame (skinned models) bypass the buffer cache, and every
++// draw from one copied its range again: the snapshot reuse above compares the whole range with
++// guest memory first, which costs what the copy does. On the first island's pier that was 8.8 MiB
++// copied a frame for 1.7 MiB of different data: each buffer is drawn about five times (shadow,
++// depth, colour passes).
++//
++// What makes one copy enough is the contract the render thread already relies on: it reads guest
++// memory when it executes a draw, some time after the game issued it, and the game waits for it at
++// GX2DrawDone before writing those buffers again (gx2_core.cpp, render_sync). So a range copied in
++// an interval is good until the interval ends, unless the game says it wrote it: GX2Invalidate
++// (in order with the draws), or a cache flush or a write fault the write tracker saw. An entry
++// also ends with its submission, as the upload slice does, and sixteen bytes are compared as a
++// tripwire. WWHD_PS5_VERTEX_INTERVAL=0 turns it off.
++} // namespace
++uint64_t ps5VertexInterval = 1;
++namespace {
++struct Ps5VertexEntry {
++  uint64_t interval = 0, generation = 0, watch = 0;
++  uint32_t address = 0, size = 0, begin = 0, length = 0, invalidated = 0;
++  bool window = false;
++  uint8_t head[16];
++  UploadSlice slice;
++};
++std::array<Ps5VertexEntry, 2048> ps5VertexEntries;
++std::vector<uint32_t> ps5InvalidateStamp;  // per 4 KiB of guest memory: the invalidation that last touched it
++uint32_t ps5InvalidateClock = 1;
++uint64_t ps5VertexReused = 0, ps5VertexReusedBytes = 0, ps5VertexCopied = 0;
++bool ps5_vertex_interval_enabled() {
++  static const bool on = [] { const char* e = std::getenv("WWHD_PS5_VERTEX_INTERVAL"); return !e || std::strcmp(e, "0") != 0; }();
++  return on;
++}
++Ps5VertexEntry& ps5_vertex_entry(uint32_t address, uint32_t size, uint32_t begin, uint32_t length, bool window) {
++  uint64_t h = (uint64_t(address) * 0x9E3779B97F4A7C15ull) ^ (uint64_t(size) << 20) ^ (uint64_t(begin) << 7) ^ length ^ uint64_t(window);
++  h ^= h >> 29;
++  return ps5VertexEntries[size_t(h * 0xBF58476D1CE4E5B9ull >> 53)];  // 11 bits
++}
++bool ps5_vertex_reuse(uint32_t address, uint32_t size, uint32_t begin, uint32_t length, bool window, UploadSlice& out) {
++  const Ps5VertexEntry& e = ps5_vertex_entry(address, size, begin, length, window);
++  if (e.interval != ps5VertexInterval || e.generation != R.submissionGeneration || e.address != address ||
++      e.size != size || e.begin != begin || e.length != length || e.window != window)
++    return false;
++  if (!ps5InvalidateStamp.empty())
++    for (uint64_t page = (uint64_t(address) + begin) >> 12, last = (uint64_t(address) + begin + length - 1) >> 12; page <= last; ++page)
++      if (ps5InvalidateStamp[page] > e.invalidated) return false;
++  if (wwatch::changed_since(address + begin, length, e.watch)) return false;
++  if (std::memcmp(mem::ptr(address + begin), e.head, std::min<uint32_t>(length, sizeof e.head))) return false;
++  ++ps5VertexReused;
++  ps5VertexReusedBytes += length;
++  out = e.slice;
++  return true;
++}
++void ps5_vertex_remember(uint32_t address, uint32_t size, uint32_t begin, uint32_t length, bool window, uint64_t watch,
++                         const UploadSlice& slice) {
++  Ps5VertexEntry& e = ps5_vertex_entry(address, size, begin, length, window);
++  e.interval = ps5VertexInterval; e.generation = R.submissionGeneration; e.watch = watch;
++  e.address = address; e.size = size; e.begin = begin; e.length = length; e.window = window;
++  e.invalidated = ps5InvalidateClock;
++  std::memcpy(e.head, mem::ptr(address + begin), std::min<uint32_t>(length, sizeof e.head));
++  e.slice = slice;
++  if (++ps5VertexCopied % 600000 == 0)
++    LOG("[vulkan] vertex ranges: %llu copied, %llu reused within their interval (%.1f MiB) since the last line",
++        600000ull, (unsigned long long)std::exchange(ps5VertexReused, 0), std::exchange(ps5VertexReusedBytes, 0) / 1048576.0);
++}
++} // namespace
++// GX2Invalidate, as the render thread executes it (surfaces.cpp)
++void ps5_vertex_invalidate(uint32_t addr, uint32_t size) {
++  if (!size || size >= 0x10000000u) { ++ps5VertexInterval; return; }  // "everything"
++  if (ps5InvalidateStamp.empty()) ps5InvalidateStamp.assign(size_t(1) << 20, 0);
++  ++ps5InvalidateClock;
++  for (uint64_t page = addr >> 12, last = (uint64_t(addr) + size - 1) >> 12; page <= last && page < ps5InvalidateStamp.size(); ++page)
++    ps5InvalidateStamp[page] = ps5InvalidateClock;
++}
++namespace {
++#endif
++
+ UploadSlice vertex_snapshot(uint32_t binding, uint32_t address, uint32_t size,
+                             bool bounded) {
+   static const bool enabled = [] {
+@@ -1825,12 +1913,47 @@ UploadSlice vertex_window_smoke_snapshot(uint32_t binding,uint32_t address,
+ void reset_ao_private_cache() { aoPrivateFrame = ~0ull; aoPrivateSource = 0; }
+ void reset_pipeline_lookup_cache() { lastPipelineLookup = {}; pipelineLookaside = {}; samplerMemo = {}; drawBatchState = {}; }
+ uint64_t draw_batch_submissions() { return drawBatchSubmissions; }
++#ifdef __PROSPERO__
++// PlayStation 5: in-between frames keep the step's shadow maps.
++//
++// At 60 fps every step of the game is drawn twice (frame interpolation: interp.cpp), each pass in
++// full. On the first island's pier that is 5,150 draws a pass, and 2,739 of them fill the shadow
++// maps: three 1024x1024 slices of one depth array, drawn with no colour target. The render thread
++// needs about 19 ms for such a pass, the two of a step do not fit in a thirtieth of a second, and
++// the game cannot run ahead of the render thread to make room (it reads guest memory as it draws).
++//
++// So on an in-between pass the draws into that depth array, and its clears (surfaces.cpp), are
++// left out: the maps of the step's first pass stay, 16 ms old for what moved. The array is the one
++// the last full pass drew into without a colour target (ps5ShadowDepth); which kind of pass this
++// is comes from the swap before it (gx2_core.cpp). WWHD_PS5_HOLD_SHADOWS=0 draws them always.
++static bool ps5HoldPass = false;
++static uint32_t ps5ShadowDepth = 0;
++static uint64_t ps5ShadowSkipped = 0;
++void ps5_set_hold_pass(bool hold) {
++  static uint64_t passes;
++  if (hold && ++passes % 3000 == 0 && preparation_stats_enabled())  // (WWHD_VK_STATS)
++    LOG("[vulkan] in-between passes: %llu so far, %.0f shadow-map draws left out of each (the maps at %08X)",
++        (unsigned long long)passes, double(std::exchange(ps5ShadowSkipped, 0)) / 3000.0, ps5ShadowDepth);
++  ps5HoldPass = hold;
++}
++bool ps5_skip_shadow_target(uint32_t depthAddress) {
++  static const bool on = [] { const char* e = std::getenv("WWHD_PS5_HOLD_SHADOWS"); return !e || std::strcmp(e, "0") != 0; }();
++  return on && ps5HoldPass && depthAddress && depthAddress == ps5ShadowDepth;
++}
++#endif
++
+ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+           uint32_t indexAddr, uint32_t baseVertex, uint32_t instances) {
+   if (!count || !instances || ((prim == 0x13 || prim == 0x14) && count < 4))
+     return;
+   if (r[REGADDR::PA_CL_CLIP_CNTL] & (1 << 22))
+     return;
++#ifdef __PROSPERO__
++  if (ps5_skip_shadow_target(r[mmDB_DEPTH_BASE]) && r[gx2::kDepthSlicesReg] > 1) {
++    ++ps5ShadowSkipped;
++    return;
++  }
++#endif
+   ((uint32_t *)r)[REGADDR::VGT_PRIMITIVE_TYPE] = prim;
+   uint64_t fsKey = 0;
+   auto *fs = vk::get_fetch_shader(r, &fsKey, R.frame);
+@@ -2017,6 +2140,33 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+                        ? depth_target(r, &depthSlice)
+                        : nullptr;
+   if (depth && depth->width == 1280 && depth->height == 720) R.mainDepthAddr = depth->addr;
++#ifdef __PROSPERO__
++  if (!ps5HoldPass && depth && !mask && r[gx2::kDepthSlicesReg] > 1) ps5ShadowDepth = depth->addr;  // the shadow maps (above)
++#endif
++#ifdef __PROSPERO__
++  {
++    // debug (WWHD_PS5_DRAW_TARGETS=1): how a frame's draws divide between its render targets
++    static const bool on = [] { const char* e = std::getenv("WWHD_PS5_DRAW_TARGETS"); return e && *e && std::strcmp(e, "0") != 0; }();
++    if (on) {
++      struct Key { uint32_t color, depth, w, h, slice; bool operator<(const Key& o) const { return std::tie(color, depth, w, h, slice) < std::tie(o.color, o.depth, o.w, o.h, o.slice); } };
++      static std::map<Key, uint32_t> counts;
++      static uint64_t since = R.frame;
++      const Surface* any = colors[0] ? colors[0] : depth;
++      ++counts[{colors[0] ? colors[0]->addr : 0, depth ? depth->addr : 0, any ? any->width : 0, any ? any->height : 0, colors[0] ? slices[0] : depthSlice}];
++      if (R.frame - since >= 600) {
++        const double frames = double(R.frame - since);
++        std::vector<std::pair<uint32_t, Key>> order;
++        for (auto& [k, n] : counts) order.push_back({n, k});
++        std::sort(order.begin(), order.end(), [](auto& x, auto& y) { return x.first > y.first; });
++        for (size_t i = 0; i < order.size() && i < 14; i++)
++          LOG("[targets] %7.1f draws/frame: colour %08X depth %08X %ux%u slice %u", order[i].first / frames, order[i].second.color,
++              order[i].second.depth, order[i].second.w, order[i].second.h, order[i].second.slice);
++        counts.clear();
++        since = R.frame;
++      }
++    }
++  }
++#endif
+   const uint32_t guestWidth = colors[0] ? colors[0]->width : 0;
+   const uint32_t guestHeight = colors[0] ? colors[0]->height : 0;
+   if (aoPrivateReplay && colors[0]) {
+@@ -2355,12 +2505,24 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+         attributeEnd && stride && extent.valid && vertexExtent.valid &&
+         windowEnd<=copied && windowBegin<windowEnd && windowBegin!=0;
+     UploadSlice b;
+-    if (!buffer_cache_enabled() || !cached_guest_range(addr, copied, rprof::kUpVertex, b))
++    if (!buffer_cache_enabled() || !cached_guest_range(addr, copied, rprof::kUpVertex, b)) {
++#ifdef __PROSPERO__
++      const uint32_t keyBegin = copyWindow ? uint32_t(windowBegin) : 0;
++      const uint32_t keyLength = copyWindow ? uint32_t(windowEnd - windowBegin) : copied;
++      const bool interval = ps5_vertex_interval_enabled() && keyLength != 0;
++      const uint64_t watch = interval ? wwatch::now() : 0;  // before the bytes are read
++      if (!interval || !ps5_vertex_reuse(addr, copied, keyBegin, keyLength, copyWindow, b)) {
++#endif
+       b = copyWindow
+         ? vertex_window_snapshot(g.attributeBufferIndex,addr,copied,
+                                  uint32_t(windowBegin),uint32_t(windowEnd-windowBegin))
+         : vertex_snapshot(g.attributeBufferIndex, addr, copied,
+                           supported && attributeEnd && extent.valid && vertexExtent.valid);
++#ifdef __PROSPERO__
++        if (interval) ps5_vertex_remember(addr, copied, keyBegin, keyLength, copyWindow, watch, b);
++      }
++#endif
++    }
+     VkDeviceSize offset = b.offset;
+     static const bool skipVertexBinds = [] {
+       const char* e=std::getenv("WWHD_VK_SKIP_VERTEX_BINDS");
 diff --git a/runtime/src/gfx/vulkan/overlay_sdl.cpp b/runtime/src/gfx/vulkan/overlay_sdl.cpp
 index 58d5039..42c5d84 100644
 --- a/runtime/src/gfx/vulkan/overlay_sdl.cpp
@@ -172,6 +463,56 @@ index 58d5039..42c5d84 100644
      if (saved("resScale", {"WWHD_RES_SCALE"})) gfxvk::set_res_scale((float)num("resScale"));
      if (saved("aoMode", {"WWHD_AO_MODE", "WWHD_NO_AO_QUIRK"})) gfxvk::set_ao_mode((int)num("aoMode"));
      if (saved("aoHires", {"WWHD_AO_HIRES"})) gfxvk::set_ao_hires(num("aoHires") != 0);
+diff --git a/runtime/src/gfx/vulkan/surfaces.cpp b/runtime/src/gfx/vulkan/surfaces.cpp
+index 79dcd53..8e4c017 100644
+--- a/runtime/src/gfx/vulkan/surfaces.cpp
++++ b/runtime/src/gfx/vulkan/surfaces.cpp
+@@ -1206,6 +1206,9 @@ void clear_color(const uint32_t*,uint32_t cb,const float rgba[4]) {
+ }
+ void clear_depth_stencil(const uint32_t*,uint32_t db,float depth,uint32_t stencil,uint32_t flags) {
+     uint32_t first,num;auto* s=surface_from_depth_buffer(db,&first,&num);if(!s)return;
++#ifdef __PROSPERO__
++    if(ps5_skip_shadow_target(s->addr))return;  // an in-between pass keeps the shadow maps (draw.cpp)
++#endif
+     VkImageAspectFlags aspects=0;if(flags&1)aspects|=VK_IMAGE_ASPECT_DEPTH_BIT;if((flags&2)&&s->fmt.stencil)aspects|=VK_IMAGE_ASPECT_STENCIL_BIT;
+     if(!aspects)return;
+     end_encoder();transition_image(s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
+@@ -1383,6 +1386,9 @@ void copy_surface(uint32_t src,uint32_t srcMip,uint32_t srcSlice,uint32_t dst,ui
+     copy_surface_impl(src,srcMip,srcSlice,dst,dstMip,dstSlice);
+ }
+ void invalidate(uint32_t flags,uint32_t addr,uint32_t size) {
++#ifdef __PROSPERO__
++    ps5_vertex_invalidate(addr,size);
++#endif
+     buffer_cache_guest_invalidate(flags,addr,size);
+     ++g_stat_invalidates;if(!(flags&2)||size>=0x10000000)return;
+     uint64_t end=uint64_t(addr)+size;
+diff --git a/runtime/src/gx2/gx2_core.cpp b/runtime/src/gx2/gx2_core.cpp
+index 1fd7427..f66cee0 100644
+--- a/runtime/src/gx2/gx2_core.cpp
++++ b/runtime/src/gx2/gx2_core.cpp
+@@ -482,6 +482,13 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
+         render::write_back();
+         break;
+     case OP_SWAP:
++#ifdef __PROSPERO__
++        // PlayStation 5: the game records a frame's drawing during one pass and plays it back at the
++        // start of the next, after the swap that ends that next pass's predecessor: what follows a
++        // swap of an in-between pass (hold = 1) is the in-between frame's drawing (seen in the
++        // order of ops here). gfx/vulkan/draw.cpp leaves the shadow maps alone for it.
++        if (render::vulkan()) gfxvk::ps5_set_hold_pass(n >= 2 && p[1]);
++#endif
+         if (n) render::set_frame_aspect(gx2::bitsf(p[0]));  // aspect ratio from the next frame on (aspect.cpp)
+         if (n >= 3 && p[2]) render::request_capture();
+         render::swap();
+@@ -821,6 +828,7 @@ HLE(gx2, GX2SwapScanBuffers) {
+     }
+     if (capture) emit_host(OP_SWAP, {ab, hold ? 1u : 0u, 1u});
+     else emit_host(OP_SWAP, {ab, hold ? 1u : 0u});
++
+     {
+         std::lock_guard<std::mutex> lk(g_flip_mutex);
+         update_flips();
 diff --git a/runtime/src/hle/swkbd.cpp b/runtime/src/hle/swkbd.cpp
 index 1b20355..1c372a9 100644
 --- a/runtime/src/hle/swkbd.cpp
@@ -222,7 +563,7 @@ index a12f7db..a449b56 100644
  }
  
 diff --git a/runtime/src/interp.cpp b/runtime/src/interp.cpp
-index ce9aed0..2214a10 100644
+index ce9aed0..3aa77d7 100644
 --- a/runtime/src/interp.cpp
 +++ b/runtime/src/interp.cpp
 @@ -669,7 +669,7 @@ void ss_reset() {
@@ -234,7 +575,7 @@ index ce9aed0..2214a10 100644
      return !g_env_paced || atoi(g_env_paced) != 0;
  #else
      return g_env_paced && atoi(g_env_paced) != 0;
-@@ -711,6 +711,35 @@ constexpr auto kPacedStep = std::chrono::nanoseconds(33'333'333);
+@@ -711,6 +711,37 @@ constexpr auto kPacedStep = std::chrono::nanoseconds(33'333'333);
  // a logic pass and an in-between pass both wait for the 59.94 Hz grid (2 x 16.68 = 33.37 ms, more
  // than kPacedStep): 2 ms of slack
  constexpr auto kPacedBudget = std::chrono::nanoseconds(kPacedStep + std::chrono::milliseconds(2));
@@ -243,34 +584,36 @@ index ce9aed0..2214a10 100644
 +// own duration. The pass is timed on the game's thread, and measured one tick of the display where
 +// the render thread was still drawing it when the next step began: the step then came a tick late,
 +// and the game ran at 85 to 95% speed on the open island with "Keep game speed" on. So: a step
-+// with an in-between pass that took more than a thirtieth of a second (and 6 ms) is a late one;
-+// one late step among the last four stops the in-between passes; a probe tries one again. A probe
-+// that is late costs its step a tick, so the wait before the next doubles, from one second to
-+// ten, and goes back to one second after thirty steps in a row that were on time.
++// with an in-between pass that took more than a thirtieth of a second (and 6 ms) is a late one.
++// Three late steps among the last four stop the in-between passes (one late step in a scene that
++// is on the edge costs a sixtieth of a second, once; a scene that does not fit is late every
++// time); a probe tries one again. A probe that is late costs its step a tick, so the wait before
++// the next doubles, from one second to four, and goes back to one second after thirty steps in a
++// row that were on time.
 +static bool g_ps5_late[4];
 +static int g_ps5_late_at = 0, g_ps5_on_time_run = 0;
 +static pace_clock::duration g_ps5_probe_after = std::chrono::seconds(1);
 +static void ps5_hold_sample(bool late, bool probe) {
 +    if (probe) {
 +        for (bool& l : g_ps5_late) l = late;
-+        if (late) g_ps5_probe_after = std::min<pace_clock::duration>(g_ps5_probe_after * 2, std::chrono::seconds(10));
++        if (late) g_ps5_probe_after = std::min<pace_clock::duration>(g_ps5_probe_after * 2, std::chrono::seconds(4));
 +    } else {
 +        g_ps5_late[g_ps5_late_at++ & 3] = late;
 +    }
 +    g_ps5_on_time_run = late ? 0 : g_ps5_on_time_run + 1;
 +    if (g_ps5_on_time_run >= 30) g_ps5_probe_after = std::chrono::seconds(1);
 +}
-+// next_pass's estimate of an in-between pass, in ticks of the display: one, or two after a late step
++// next_pass's estimate of an in-between pass, in ticks of the display: one, or two while they do not fit
 +static int64_t ps5_hold_estimate(int64_t tick) {
-+    for (bool late : g_ps5_late)
-+        if (late) return 2 * tick;
-+    return tick;
++    int late = 0;
++    for (bool l : g_ps5_late) late += l;
++    return late >= 3 ? 2 * tick : tick;
 +}
 +#endif
  // start of every pass: the last pass's own duration, and the wait before a logic pass that follows
  // a dropped in-between pass (and at 120/240 fps before every logic pass that comes early)
  static void paced_pass_start() {
-@@ -726,6 +755,11 @@ static void paced_pass_start() {
+@@ -726,6 +757,11 @@ static void paced_pass_start() {
          pace_clock::duration& avg = g_pass_was_hold ? g_hold_avg : g_logic_avg;
          // a probe after a long pause replaces the old value: the scene may have changed since
          avg = g_pass_was_hold && g_probe ? pass : pace_clock::duration(pacing::update_average(avg.count(), pass.count()));
@@ -282,7 +625,7 @@ index ce9aed0..2214a10 100644
          if (g_pass_was_hold) g_probe = false;
      }
      g_pass_was_hold = g_hold_next;
-@@ -798,8 +832,18 @@ static void after_pass(int phase) {
+@@ -798,8 +834,18 @@ static void after_pass(int phase) {
      const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now - g_last_logic).count();
      // After a long time without in-between passes their cost is stale (the scene may be lighter
      // now): one probe, if one vsync tick fits; its duration replaces the estimate.
@@ -301,6 +644,14 @@ index ce9aed0..2214a10 100644
      switch (pacing::next_pass(phase, g_step_n, elapsed, pass, kPacedBudget.count())) {
      case pacing::Next::kHold:
          g_hold_next = true;
+@@ -951,6 +997,7 @@ extern "C" void hook_0203593C(Cpu* c) {
+         if (true60::enabled()) g_step_n = 1;  // (switched to true 60 within a step)
+         g_hold = true;
+         g_hold_frame = true;
++
+         PassTimer timer(record_pass() ? 2 : 1);
+         if (record_pass()) {
+             g_record_passes++;
 diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
 index 0deb727..9008334 100644
 --- a/runtime/src/main.cpp
@@ -616,7 +967,7 @@ index e2d0ee0..fdb699f 100644
  #endif
              LOG("[heaplog] heap %08X (flags %08X, %08X..%08X) first alloc by \"%s\" (%08X) size %X lr %08X", h, ld32(h + 0x90),
 diff --git a/runtime/src/write_watch.cpp b/runtime/src/write_watch.cpp
-index 201e5f4..985bd06 100644
+index 201e5f4..a9f36ae 100644
 --- a/runtime/src/write_watch.cpp
 +++ b/runtime/src/write_watch.cpp
 @@ -16,6 +16,10 @@
@@ -641,6 +992,28 @@ index 201e5f4..985bd06 100644
      // not ours: the crash handler (main.cpp) or whatever was installed before
      struct sigaction& o = sig == SIGBUS ? g_old_bus : g_old_segv;
      if (o.sa_flags & SA_SIGINFO) o.sa_sigaction(sig, si, uc);
+@@ -227,6 +235,7 @@ bool changed_since(uint32_t addr, uint32_t size, uint64_t stamp) {
+ }
+ 
+ uint64_t write_seq() { return g_seq.load(std::memory_order_acquire); }
++uint64_t now() { return g_clock.load(std::memory_order_acquire); }
+ 
+ void enable_hints() {
+     static std::once_flag once;
+diff --git a/runtime/src/write_watch.h b/runtime/src/write_watch.h
+index 064ac33..208ee66 100644
+--- a/runtime/src/write_watch.h
++++ b/runtime/src/write_watch.h
+@@ -56,6 +56,9 @@ bool written_since(uint32_t addr, uint32_t size, uint64_t stamp);
+ // written_since, or a hint for one of the pages newer than stamp
+ bool changed_since(uint32_t addr, uint32_t size, uint64_t stamp);
+ uint64_t write_seq();
++// The clock the stamps are taken from: a range unchanged per changed_since(addr, size, now()) taken
++// before it was read has not been written (as far as faults and hints tell) since that read.
++uint64_t now();
+ 
+ // Explicit guest signals (see above). hint() is a no-op until enable_hints(); any thread. Ranges of
+ // 256 MiB or more ("everything") are ignored, as GX2Invalidate's texture handling does.
 diff --git a/tools/recomp/hooks_ps5.txt b/tools/recomp/hooks_ps5.txt
 new file mode 100644
 index 0000000..9380fa7
