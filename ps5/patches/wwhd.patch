@@ -223,7 +223,7 @@ index c35350b..4598941 100644
          b.write_back = gfxvk::write_back_linear_targets;
          b.ss_reset = [] {
 diff --git a/runtime/src/gfx/vulkan/draw.cpp b/runtime/src/gfx/vulkan/draw.cpp
-index 0f676e1..0ccdbd8 100644
+index 0f676e1..2efaccf 100644
 --- a/runtime/src/gfx/vulkan/draw.cpp
 +++ b/runtime/src/gfx/vulkan/draw.cpp
 @@ -18,7 +18,12 @@
@@ -336,7 +336,7 @@ index 0f676e1..0ccdbd8 100644
  UploadSlice vertex_snapshot(uint32_t binding, uint32_t address, uint32_t size,
                              bool bounded) {
    static const bool enabled = [] {
-@@ -1825,12 +1913,47 @@ UploadSlice vertex_window_smoke_snapshot(uint32_t binding,uint32_t address,
+@@ -1825,12 +1913,49 @@ UploadSlice vertex_window_smoke_snapshot(uint32_t binding,uint32_t address,
  void reset_ao_private_cache() { aoPrivateFrame = ~0ull; aoPrivateSource = 0; }
  void reset_pipeline_lookup_cache() { lastPipelineLookup = {}; pipelineLookaside = {}; samplerMemo = {}; drawBatchState = {}; }
  uint64_t draw_batch_submissions() { return drawBatchSubmissions; }
@@ -352,7 +352,7 @@ index 0f676e1..0ccdbd8 100644
 +// So on an in-between pass the draws into that depth array, and its clears (surfaces.cpp), are
 +// left out: the maps of the step's first pass stay, 16 ms old for what moved. The array is the one
 +// the last full pass drew into without a colour target (ps5ShadowDepth); which kind of pass this
-+// is comes from the swap before it (gx2_core.cpp). WWHD_PS5_HOLD_SHADOWS=0 draws them always.
++// is comes from the swap before it (gx2_core.cpp). WWHD_PS5_HOLD_SHADOWS=1 turns this on.
 +static bool ps5HoldPass = false;
 +static uint32_t ps5ShadowDepth = 0;
 +static uint64_t ps5ShadowSkipped = 0;
@@ -364,7 +364,9 @@ index 0f676e1..0ccdbd8 100644
 +  ps5HoldPass = hold;
 +}
 +bool ps5_skip_shadow_target(uint32_t depthAddress) {
-+  static const bool on = [] { const char* e = std::getenv("WWHD_PS5_HOLD_SHADOWS"); return !e || std::strcmp(e, "0") != 0; }();
++  // Off unless asked for: the in-between frame's shadow parameters do not match the held maps, and
++  // whole surfaces go dark for a frame whenever the camera moves.
++  static const bool on = [] { const char* e = std::getenv("WWHD_PS5_HOLD_SHADOWS"); return e && std::strcmp(e, "1") == 0; }();
 +  return on && ps5HoldPass && depthAddress && depthAddress == ps5ShadowDepth;
 +}
 +#endif
@@ -384,7 +386,7 @@ index 0f676e1..0ccdbd8 100644
    ((uint32_t *)r)[REGADDR::VGT_PRIMITIVE_TYPE] = prim;
    uint64_t fsKey = 0;
    auto *fs = vk::get_fetch_shader(r, &fsKey, R.frame);
-@@ -2017,6 +2140,33 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2017,6 +2142,33 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
                         ? depth_target(r, &depthSlice)
                         : nullptr;
    if (depth && depth->width == 1280 && depth->height == 720) R.mainDepthAddr = depth->addr;
@@ -418,7 +420,7 @@ index 0f676e1..0ccdbd8 100644
    const uint32_t guestWidth = colors[0] ? colors[0]->width : 0;
    const uint32_t guestHeight = colors[0] ? colors[0]->height : 0;
    if (aoPrivateReplay && colors[0]) {
-@@ -2355,12 +2505,24 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2355,12 +2507,24 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
          attributeEnd && stride && extent.valid && vertexExtent.valid &&
          windowEnd<=copied && windowBegin<windowEnd && windowBegin!=0;
      UploadSlice b;

@@ -25,7 +25,7 @@ read in the console's log; nothing else is claimed.
 | --- | --- | --- |
 | Start-up | Boots to the title screen; a new Quest Log through the prologue and the first cutscene into play; a saved Quest Log continued after a restart | |
 | Rendering | 3840x2160 output on a 59.94 Hz display; the title screen, menus, the prologue, the first island and its characters look right; the recompilation's renderer self-test passes | Anything past the first island; a comparison with a Wii U, frame for frame; 120 Hz |
-| Frame rate | 60 fps (the default, at 3x internal resolution) on the first island: running around it with the camera turning, 58.8 to 59.9 frames a second in fifteen of sixteen four-second windows (one at 47.7), the game at 29.4 to 30.0 steps a second throughout; 59.9 in menus, the prologue and the pause menu | A long session; later, heavier areas; whether shadows shimmer when the camera moves (see Known limits) |
+| Frame rate | 60 fps in menus, the prologue and the pause menu (59.9 measured). On the open first island the game keeps full speed (29.6 to 30.0 steps a second) and shows 30 frames a second: a full pass takes the render thread about 20 ms, and two do not fit in a step | A long session; later, heavier areas |
 | 30 fps | The game's own rate, chosen in Settings: 30.0 frames and 30.0 game steps a second on the island's pier | |
 | Settings | Opened with the touchpad button and driven from the pad: tabs, frame rate, internal resolution, save states; choices kept across a restart | Every option in it |
 | Text entry | The console's own keyboard for the name of a new Quest Log, and the name it gave back in the game | |
@@ -37,18 +37,16 @@ read in the console's log; nothing else is claimed.
 
 Known limits:
 
-- **60 fps is frame interpolation, with two things done for it here.** The game
-  runs 30 steps a second and each is drawn twice. On the open island a pass is
-  about 5,150 draws, and two did not fit in a thirtieth of a second (about 43 ms
-  a step). So (1) the in-between frame keeps the step's shadow maps instead of
-  drawing them again (2,739 of those draws; `WWHD_PS5_HOLD_SHADOWS=0` in
-  `env.txt` draws them always): shadows are up to a sixtieth of a second old on
-  those frames, and whether that shows as a shimmer under a moving camera has
-  only been checked in stills. And (2) where both passes still do not fit, the
-  in-between frame is left out and the game keeps its speed: such a scene shows
-  30 frames a second. The first island is at the edge of fitting.
-- **A locked 60 everywhere is not proven.** Nothing past the first island has
-  been measured. The game cannot run ahead of the render thread to make room
+- **60 fps is frame interpolation, and the open island does not reach it.** The
+  game runs 30 steps a second and each is drawn twice. On the open island a pass
+  is about 5,150 draws and about 20 ms of the render thread, so two do not fit
+  in a thirtieth of a second: there the in-between frame is left out, the game
+  keeps its speed and the scene shows 30 frames a second. Keeping the step's
+  shadow maps for the in-between frame (2,739 of those draws) did reach 60, but
+  the in-between frame's shadow parameters do not match the kept maps: whole
+  surfaces went dark for a frame whenever the camera moved. It is off;
+  `WWHD_PS5_HOLD_SHADOWS=1` in `env.txt` turns it on for experiments.
+- **Nothing past the first island has been measured.** The game cannot run ahead of the render thread to make room
   (tried: the render thread read a surface the game had reused), so a heavier
   scene needs cheaper passes: the render thread spends about 3 microseconds a
   draw (`ps5/src/sampler_ps5.cpp` has the profile).
