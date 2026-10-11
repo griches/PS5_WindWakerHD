@@ -9,7 +9,7 @@ header, and may also be used under that licence alone.
 | --- | --- | --- |
 | `ps5/tools/png-to-title-dds.py` (encoder from PS5 RetroArch, by Mihawk) | GPL-3.0-or-later | [`licenses/GPL-3.0.txt`](licenses/GPL-3.0.txt) |
 | `ps5/src/platform.c`, `ps5/src/platform.h` and the tools taken from the PS5 Vulkan Template (by Mihawk) | MIT | [`licenses/MIT.txt`](licenses/MIT.txt) |
-| The rest of `ps5/src/`, `ps5/tools/`, `ps5/cmake/` and `ps5/art/` (written for this port) | MIT | [`licenses/MIT.txt`](licenses/MIT.txt) |
+| The rest of `ps5/src/`, `ps5/tools/`, `ps5/cmake/`, `ps5/kit/` and `ps5/art/` (written for this port) | MIT | [`licenses/MIT.txt`](licenses/MIT.txt) |
 | `ps5/sdl/` (SDL3 drivers for the console) and `ps5/patches/sdl.patch` | Zlib, as SDL | [`licenses/Zlib.txt`](licenses/Zlib.txt) |
 | `ps5/patches/wwhd.patch` | MPL-2.0, as ZeldaWWHDRecomp | in `vendor/wwhd/LICENSE` |
 
@@ -33,6 +33,11 @@ A built `eboot.bin` holds the game's own code, translated to C from your dump an
 compiled. Whatever the licences above allow for the rest, that part is not yours
 or mine to share: a built title, the `game/` folder and the generated code stay
 on the machine that made them.
+
+The builder kit (`ps5/tools/package-kit.sh`) is what can be shared: the same
+build without that part. It holds compiled forms of the projects above, under
+their licences, with `SOURCES.txt` naming each one's repository and revision,
+and nothing of the game.
 
 ## What is not covered
 

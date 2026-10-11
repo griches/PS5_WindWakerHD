@@ -10,6 +10,7 @@
 # its CRT, its native tool (ELF -> the console's fake SELF) and its libc.prx,
 # as its CTS title links them. The title folder, dist/<TITLE_ID>/, gets the
 # signed eboot.bin, sce_sys/ and the licences. OBJECT may be an archive.
+# PS5_DIST_DIR is where the title folder goes instead of dist/ (the builder kit).
 #
 # Copyright (C) 2026 Mihawk
 # SPDX-License-Identifier: MIT
@@ -127,7 +128,7 @@ fi
 
 # The title folder
 title_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["titleId"])' "$param")
-app="$root/dist/$title_id"
+app="${PS5_DIST_DIR:-$root/dist}/$title_id"
 mkdir -p "$app/sce_sys" "$app/sce_module"
 "$tool" self --sign --in "$work/eboot.elf.new" --out "$app/eboot.bin" --magic 0x1D3D154F
 "$tool" self --inspect --file "$app/eboot.bin" > /dev/null

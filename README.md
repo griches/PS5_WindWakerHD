@@ -59,8 +59,9 @@ Known limits:
   DualSense button that plays that Wii U button, so it follows `Controls > Face
   buttons`. The font is known by its bytes (the USA game's); button pictures
   inside message text come from another font and still show the Wii U's.
-- **You build it yourself, from your dump.** The executable contains the game's
+- **You make it yourself, from your dump.** The executable contains the game's
   translated code, so no built title can be shared: see "Why there is no download".
+  The builder kit does it for you.
 - **No downloads from inside the title**: the mod catalogue and updates are off.
 - **No code mods.** A title cannot load code at run time.
 - **Save states need a Quest Log in play** (upstream's rule): a state asked for
@@ -72,8 +73,14 @@ Other ports here ship a title folder with no game in it, and you add a disc
 image. This one cannot: a static recompilation turns the game's program into the
 port's program, so `eboot.bin` *is* the game's code, compiled for another
 processor. That file, the `game/` folder and the generated C all stay on the
-machine that made them. `.gitignore` keeps them out of the repository, and
-there is no release packaging on purpose.
+machine that made them. `.gitignore` keeps them out of the repository, and no
+release ever holds a built title.
+
+What a release holds instead is the **builder kit**: everything of a build but
+the game (the port's own compiled parts, RADV, the SDK's libraries, the
+recompiler) and a script that does the last step on your computer, from your
+dump, in a container. With it you need Docker and the dump, not the build
+set-up below. Its own `README.md` (`ps5/kit/README.md` here) has the steps.
 
 ## Build
 
@@ -108,6 +115,7 @@ ps5/tools/build.sh                            # dist/PPSA99306/
 | `deploy.sh` | Uploads `dist/PPSA99306/` over FTP (the console's address is `PS5_HOST` in `PS5_Vulkan/.env`). |
 | `console-files.sh game` | Uploads `game/` beside the title, skipping what is already there. Also `put`, `get`, `rm`, `ls`. |
 | `run.sh` | Launches the title through PS5_Vulkan's control payload and follows its log; symbolises a crash. |
+| `package-kit.sh [VERSION]` | Builds, then collects the builder kit into `dist/kit/`: the build without the game's code, and `ps5/kit/`'s scripts. |
 | `vm.sh TOOL` | From macOS, runs one of the above inside a Lima VM named `ps5`. |
 | `symbolise-samples.py` | Turns the profile a thread wrote (`WWHD_PS5_SAMPLE=<thread>:<wait>:<count>` in `env.txt`) into a table of functions. |
 | `ps5/art/make-title-art.sh` | Makes `sce_sys/icon0.png`, `pic0.dds` and `pic1.dds` from the pictures in `ps5/art/`. |
