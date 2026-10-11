@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 4ae364f..5388bfd 100644
+index 4ae364f..7baa021 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -141,6 +141,11 @@ elseif(ANDROID)
@@ -10,7 +10,7 @@ index 4ae364f..5388bfd 100644
 +  # PlayStation 5: no downloads (the catalogue of mods is not reachable from a title)
 +  list(APPEND RUNTIME_SOURCES ${PS5_PORT_DIR}/ps5/src/https_ps5.cpp ${PS5_PORT_DIR}/ps5/src/guestmem_ps5.cpp
 +       ${PS5_PORT_DIR}/ps5/src/ime_ps5.cpp ${PS5_PORT_DIR}/ps5/src/sampler_ps5.cpp
-+       ${PS5_PORT_DIR}/ps5/src/controller_ps5.cpp)
++       ${PS5_PORT_DIR}/ps5/src/controller_ps5.cpp ${PS5_PORT_DIR}/ps5/src/threads_ps5.cpp)
  elseif(UNIX AND NOT ANDROID)
    # libcurl is loaded at run time (dlopen); only its headers are needed. They are copied on their own:
    # their directory (e.g. /usr/include/x86_64-linux-gnu) also holds the system's glibc headers, which
@@ -153,7 +153,7 @@ index 7ac593e..4dea30b 100644
  }
  static bool close_request(const SDL_Event& event) {
 diff --git a/runtime/src/gfx/vulkan/overlay_sdl.cpp b/runtime/src/gfx/vulkan/overlay_sdl.cpp
-index 58d5039..0f8d8e8 100644
+index 58d5039..42c5d84 100644
 --- a/runtime/src/gfx/vulkan/overlay_sdl.cpp
 +++ b/runtime/src/gfx/vulkan/overlay_sdl.cpp
 @@ -207,6 +207,15 @@ void load_saved_options() {
@@ -161,13 +161,13 @@ index 58d5039..0f8d8e8 100644
      auto saved = [&](const char* key, std::initializer_list<const char*> env) { return !env_set(env) && v.count(key); };
      auto num = [&](const char* key) { return atof(v[key].c_str()); };
 +#ifdef __PROSPERO__
-+    // PlayStation 5, first start (nothing saved yet): three times the internal resolution at the
-+    // game's own 30 fps, the best picture that held full speed where it was measured (the first
-+    // island's pier, 5,100 draws a frame, 2026-10-11: 30.0 frames and 30.0 logic steps a second, the
-+    // render thread idle half of each frame). 60 fps (frame interpolation) is the player's to turn
-+    // on: it held in light scenes and ran that one at half speed, at every resolution, because the
-+    // game thread and the render thread together need more than a sixtieth of a second for it.
++    // PlayStation 5, first start (nothing saved yet): three times the internal resolution, and
++    // 60 fps (frame interpolation) keeping the game's speed (interp.cpp: on by default here). Where
++    // it was measured (2026-10-11), light scenes drew 59.9 frames a second; the first island's pier
++    // (5,100 draws a frame) does not fit two passes in a thirtieth of a second, and there the
++    // in-between frames are left out: 30 frames a second, the game at full speed.
 +    if (!v.count("resScale") && !env_set({"WWHD_RES_SCALE"})) gfxvk::set_res_scale(3.0f);
++    if (!v.count("fps60") && !env_set({"WWHD_INTERP", "WWHD_TRUE60", "WWHD_INTERP_FPS"})) interp::set_mode(1);
 +#endif
      if (saved("resScale", {"WWHD_RES_SCALE"})) gfxvk::set_res_scale((float)num("resScale"));
      if (saved("aoMode", {"WWHD_AO_MODE", "WWHD_NO_AO_QUIRK"})) gfxvk::set_ao_mode((int)num("aoMode"));
@@ -221,6 +221,86 @@ index a12f7db..a449b56 100644
      return m;
  }
  
+diff --git a/runtime/src/interp.cpp b/runtime/src/interp.cpp
+index ce9aed0..2214a10 100644
+--- a/runtime/src/interp.cpp
++++ b/runtime/src/interp.cpp
+@@ -669,7 +669,7 @@ void ss_reset() {
+ // values.
+ static const char* const g_env_paced = getenv("WWHD_INTERP_PACED");
+ static std::atomic<bool> g_paced{[] {
+-#ifdef __ANDROID__
++#if defined(__ANDROID__) || defined(__PROSPERO__)  // (PlayStation 5: the open sea does not fit two passes a step)
+     return !g_env_paced || atoi(g_env_paced) != 0;
+ #else
+     return g_env_paced && atoi(g_env_paced) != 0;
+@@ -711,6 +711,35 @@ constexpr auto kPacedStep = std::chrono::nanoseconds(33'333'333);
+ // a logic pass and an in-between pass both wait for the 59.94 Hz grid (2 x 16.68 = 33.37 ms, more
+ // than kPacedStep): 2 ms of slack
+ constexpr auto kPacedBudget = std::chrono::nanoseconds(kPacedStep + std::chrono::milliseconds(2));
++#ifdef __PROSPERO__
++// PlayStation 5: whether an in-between pass fits is read from what it did to its step, not from its
++// own duration. The pass is timed on the game's thread, and measured one tick of the display where
++// the render thread was still drawing it when the next step began: the step then came a tick late,
++// and the game ran at 85 to 95% speed on the open island with "Keep game speed" on. So: a step
++// with an in-between pass that took more than a thirtieth of a second (and 6 ms) is a late one;
++// one late step among the last four stops the in-between passes; a probe tries one again. A probe
++// that is late costs its step a tick, so the wait before the next doubles, from one second to
++// ten, and goes back to one second after thirty steps in a row that were on time.
++static bool g_ps5_late[4];
++static int g_ps5_late_at = 0, g_ps5_on_time_run = 0;
++static pace_clock::duration g_ps5_probe_after = std::chrono::seconds(1);
++static void ps5_hold_sample(bool late, bool probe) {
++    if (probe) {
++        for (bool& l : g_ps5_late) l = late;
++        if (late) g_ps5_probe_after = std::min<pace_clock::duration>(g_ps5_probe_after * 2, std::chrono::seconds(10));
++    } else {
++        g_ps5_late[g_ps5_late_at++ & 3] = late;
++    }
++    g_ps5_on_time_run = late ? 0 : g_ps5_on_time_run + 1;
++    if (g_ps5_on_time_run >= 30) g_ps5_probe_after = std::chrono::seconds(1);
++}
++// next_pass's estimate of an in-between pass, in ticks of the display: one, or two after a late step
++static int64_t ps5_hold_estimate(int64_t tick) {
++    for (bool late : g_ps5_late)
++        if (late) return 2 * tick;
++    return tick;
++}
++#endif
+ // start of every pass: the last pass's own duration, and the wait before a logic pass that follows
+ // a dropped in-between pass (and at 120/240 fps before every logic pass that comes early)
+ static void paced_pass_start() {
+@@ -726,6 +755,11 @@ static void paced_pass_start() {
+         pace_clock::duration& avg = g_pass_was_hold ? g_hold_avg : g_logic_avg;
+         // a probe after a long pause replaces the old value: the scene may have changed since
+         avg = g_pass_was_hold && g_probe ? pass : pace_clock::duration(pacing::update_average(avg.count(), pass.count()));
++#ifdef __PROSPERO__
++        // (60 fps: a step is its logic pass and one in-between pass, and this logic pass follows it)
++        if (g_pass_was_hold && !g_hold_next && g_last_logic != pace_clock::time_point{})
++            ps5_hold_sample(now - g_last_logic > kPacedStep + std::chrono::milliseconds(6), g_probe);
++#endif
+         if (g_pass_was_hold) g_probe = false;
+     }
+     g_pass_was_hold = g_hold_next;
+@@ -798,8 +832,18 @@ static void after_pass(int phase) {
+     const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now - g_last_logic).count();
+     // After a long time without in-between passes their cost is stale (the scene may be lighter
+     // now): one probe, if one vsync tick fits; its duration replaces the estimate.
++#ifdef __PROSPERO__
++    const bool probe = phase == 0 && now - g_last_hold >= g_ps5_probe_after;
++#else
+     const bool probe = phase == 0 && now - g_last_hold >= kProbeAfter;
++#endif
++#ifdef __PROSPERO__
++    // PlayStation 5: one tick, or two after a step that an in-between pass made late (ps5_hold_estimate)
++    const int64_t tick = std::chrono::duration_cast<std::chrono::nanoseconds>(vsync_tick()).count();
++    const auto pass = probe ? tick : ps5_hold_estimate(tick);
++#else
+     const auto pass = std::chrono::duration_cast<std::chrono::nanoseconds>(probe ? vsync_tick() : g_hold_avg).count();
++#endif
+     switch (pacing::next_pass(phase, g_step_n, elapsed, pass, kPacedBudget.count())) {
+     case pacing::Next::kHold:
+         g_hold_next = true;
 diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
 index 0deb727..9008334 100644
 --- a/runtime/src/main.cpp
@@ -310,21 +390,22 @@ index 0deb727..9008334 100644
      }).detach();
      render::run_main_loop();
 diff --git a/runtime/src/platform/host.h b/runtime/src/platform/host.h
-index 7787a3f..9590382 100644
+index 7787a3f..42a39cd 100644
 --- a/runtime/src/platform/host.h
 +++ b/runtime/src/platform/host.h
-@@ -28,6 +28,10 @@
+@@ -28,6 +28,11 @@
  #include <sys/resource.h>
  #include <sys/syscall.h>
  #endif
 +#ifdef __PROSPERO__
 +extern "C" void ps5_fp_ieee(void);  // ps5platform/fp.h
 +extern "C" void ps5_sampler_thread(const char* name);
++extern "C" void ps5_thread_place(const char* name);
 +#endif
  namespace host {
  #if defined(__APPLE__) && defined(WWHD_HAS_VULKAN)
  // Render command batches can create Objective-C temporaries inside MoltenVK.
-@@ -54,6 +58,12 @@ inline void set_thread_name(const char* name) {
+@@ -54,6 +59,13 @@ inline void set_thread_name(const char* name) {
   using SetDescription=HRESULT(WINAPI*)(HANDLE,PCWSTR);
   auto f=(SetDescription)GetProcAddress(GetModuleHandleW(L"Kernel32.dll"),"SetThreadDescription");
   if(f) { std::wstring text; for(unsigned char c:thread_label)text.push_back(c); f(GetCurrentThread(),text.c_str()); }
@@ -333,11 +414,12 @@ index 7787a3f..9590382 100644
 + // itself first: a title's threads start with denormals flushed to zero, and the recompiled code
 + // needs IEEE arithmetic.
 + ps5_fp_ieee();
++ ps5_thread_place(name);    // a core each for the game's main thread and the render thread (ps5/src/threads_ps5.cpp)
 + ps5_sampler_thread(name);  // WWHD_PS5_SAMPLE (ps5/src/sampler_ps5.cpp); nothing without it
  #else
   pthread_setname_np(pthread_self(),thread_label.substr(0,15).c_str());
  #endif
-@@ -77,6 +87,8 @@ inline void boost_thread_priority() {
+@@ -77,6 +89,8 @@ inline void boost_thread_priority() {
    PowerThrottling state{1 /* THREAD_POWER_THROTTLING_CURRENT_VERSION */,1 /* EXECUTION_SPEED */,0 /* off */};
    set_info(GetCurrentThread(),3 /* ThreadPowerThrottling */,&state,sizeof state);
   }
@@ -346,7 +428,7 @@ index 7787a3f..9590382 100644
  #else
   setpriority(PRIO_PROCESS,(id_t)syscall(SYS_gettid),-5);  // EPERM without CAP_SYS_NICE: ignored
  #endif
-@@ -102,6 +114,8 @@ inline uintptr_t executable_base() {
+@@ -102,6 +116,8 @@ inline uintptr_t executable_base() {
  inline std::string executable_path() {
  #ifdef _WIN32
   char path[32768]; DWORD n=GetModuleFileNameA(nullptr,path,sizeof path);return std::string(path,n);
@@ -355,7 +437,7 @@ index 7787a3f..9590382 100644
  #elif !defined(__APPLE__)
   char path[4096];ssize_t n=readlink("/proc/self/exe",path,sizeof path);return n>0?std::string(path,n):std::string();
  #else
-@@ -153,6 +167,8 @@ inline std::string exe_dir() {
+@@ -153,6 +169,8 @@ inline std::string exe_dir() {
    if(_NSGetExecutablePath(buf,&n)==0){ char real[PATH_MAX]; p=realpath(buf,real)?real:buf; }
  #elif defined(_WIN32)
    char buf[MAX_PATH*4]; DWORD n=GetModuleFileNameA(nullptr,buf,sizeof buf); if(n>0&&n<sizeof buf) p.assign(buf,n);

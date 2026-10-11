@@ -25,8 +25,8 @@ read in the console's log; nothing else is claimed.
 | --- | --- | --- |
 | Start-up | Boots to the title screen; a new Quest Log through the prologue and the first cutscene into play; a saved Quest Log continued after a restart | |
 | Rendering | 3840x2160 output on a 59.94 Hz display; the title screen, menus, the prologue, the first island and its characters look right; the recompilation's renderer self-test passes | Anything past the first island; a comparison with a Wii U, frame for frame; 120 Hz |
-| Frame rate | 30 fps (original) at 3x internal resolution: 30.0 frames and 30.0 logic steps a second on the first island's pier (5,100 draws a frame) | A long session; later, heavier areas |
-| 60 fps | Frame interpolation holds 59.9 frames a second in light scenes (menus, the prologue, the lookout) | **It does not hold on the open island**: about 30 frames a second there and the game at half speed (see Known limits) |
+| Frame rate | 60 fps where it fits, 30 where it does not, the game at full speed in both: 59.9 frames a second in light scenes (menus, the prologue, the lookout, the pause menu), and on the first island's pier (5,100 draws a frame) 29.9 frames and 29.8 to 29.9 game steps a second, at 3x internal resolution; it moved between the two by itself as the view changed | A long session; later, heavier areas; how the change between 60 and 30 feels in play |
+| 30 fps | The game's own rate, chosen in Settings: 30.0 frames and 30.0 game steps a second on the same pier | |
 | Settings | Opened with the touchpad button and driven from the pad: tabs, frame rate, internal resolution, save states; choices kept across a restart | Every option in it |
 | Text entry | The console's own keyboard for the name of a new Quest Log, and the name it gave back in the game | |
 | Input | Menus, dialogue, walking and the camera from the sticks, the pause menu; "Wii U GamePad" chosen on the selection screen and the game still played, menus on the TV | Each button in play; rumble; motion; a second controller |
@@ -36,14 +36,16 @@ read in the console's log; nothing else is claimed.
 
 Known limits:
 
-- **60 fps is not full speed everywhere yet.** The default is the game's own
-  30 fps, which held full speed wherever it was measured. `Settings > Graphics >
-  60 fps` draws an in-between frame for each of the game's; where the console
-  cannot draw both in time (the open island: 5,100 draws a frame), the game runs
-  at half speed, and "Keep game speed" does not help yet. The game thread and
-  the render thread take turns for most of a frame, and their sum is over a
-  sixtieth of a second there (about 15 ms and 20 ms, sampled with
-  `ps5/src/sampler_ps5.cpp`). The render thread's cost per draw is where to look.
+- **60 fps is not a locked 60 yet.** The default draws an in-between frame for
+  each of the game's (frame interpolation) wherever both fit in a thirtieth of a
+  second, and leaves it out where they do not, so the game keeps its speed: the
+  open island (5,100 draws a frame) shows 30 frames a second. One pass there
+  costs the render thread about 15.5 ms of CPU and 18.5 ms of wall time, over
+  the 16.7 ms a sixtieth allows (sampled with `ps5/src/sampler_ps5.cpp`: the
+  cost is spread over the whole draw path, about 3 microseconds a draw, plus
+  five command submissions a frame at half a millisecond each). `Settings >
+  Graphics` has 30 fps (the game's own) and "Keep game speed"; with that off,
+  every in-between frame is drawn and such scenes run slow.
 - **You build it yourself, from your dump.** The executable contains the game's
   translated code, so no built title can be shared: see "Why there is no download".
 - **No downloads from inside the title**: the mod catalogue and updates are off.
@@ -177,6 +179,15 @@ What the console needed, each found on it and explained where it is handled:
   served from the CPU's timestamp counter, anchored to the kernel's clock once a
   second (`ps5/src/shims.c`).
 - **Built for a Zen 2** (`-march=znver2`); the toolchain's default is the first x86-64.
+- **A core each for the two busy threads**: the game's main thread and the
+  render thread are kept on their own cores, and the runtime's other threads
+  off them (`ps5/src/threads_ps5.cpp`).
+- **In-between frames judged by their result.** Upstream's pacing times an
+  in-between pass on the game's thread; here that measured one tick of the
+  display while the render thread was still drawing, so the next step came
+  late and the game ran slow. The console's rule looks at the step instead:
+  one that an in-between frame made late stops them, and a probe (every one
+  to ten seconds) brings them back (`runtime/src/interp.cpp`, in the patch).
 - **A title never exits**: it asks the shell to close it (`ps5/src/platform.c`).
 - **IEEE floating point on every thread**: a title's threads start with
   denormals flushed to zero, and the recompiled code needs exact arithmetic.
