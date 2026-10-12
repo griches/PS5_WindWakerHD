@@ -1,5 +1,9 @@
 # Wind Waker HD for PlayStation 5
 
+[![stars](https://img.shields.io/github/stars/griches/PS5_WindWakerHD?style=flat)](https://github.com/griches/PS5_WindWakerHD/stargazers)
+[![release](https://img.shields.io/github/v/release/griches/PS5_WindWakerHD)](https://github.com/griches/PS5_WindWakerHD/releases/latest)
+[![licence](https://img.shields.io/badge/licence-GPL--3.0-blue)](LICENSING.md)
+
 A PS5 homebrew port of [ZeldaWWHDRecomp](https://github.com/ZeldaWWHDRecomp/ZeldaWWHDRecomp),
 the static recompilation of the Wii U version of a classic sailing adventure. The
 game's PowerPC code is translated to C ahead of time and compiled for the console;
