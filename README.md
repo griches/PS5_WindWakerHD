@@ -29,7 +29,7 @@ read in the console's log; nothing else is claimed.
 | --- | --- | --- |
 | Start-up | Boots to the title screen; a new Quest Log through the prologue and the first cutscene into play; a saved Quest Log continued after a restart | |
 | Rendering | 3840x2160 output on a 59.94 Hz display; the title screen, menus, the prologue, the first island and its characters look right; the recompilation's renderer self-test passes | Anything past the first island; a comparison with a Wii U, frame for frame; 120 Hz |
-| Frame rate | 60 fps in menus, the prologue and the pause menu (59.9 measured). On the open first island the game keeps full speed (29.6 to 30.0 steps a second) and shows 30 frames a second: a full pass takes the render thread about 20 ms, and two do not fit in a step | A long session; later, heavier areas |
+| Frame rate | 60 fps (frame interpolation, "Keep game speed") on the first island: standing on the beach by the pier and walking along it with the camera turning, every in-between frame is drawn (59.9 to 60.0 frames and 29.9 to 30.0 game steps a second over 100-second runs; frame intervals 16.7 ms at the median, 95th and 99th percentile, a rare one of 20 to 30 ms) | A long session; later, heavier areas |
 | 30 fps | The game's own rate, chosen in Settings: 30.0 frames and 30.0 game steps a second on the island's pier | |
 | Settings | Opened with the touchpad button and driven from the pad: tabs, frame rate, internal resolution, save states; choices kept across a restart | Every option in it |
 | Text entry | The console's own keyboard for the name of a new Quest Log, and the name it gave back in the game | |
@@ -41,19 +41,20 @@ read in the console's log; nothing else is claimed.
 
 Known limits:
 
-- **60 fps is frame interpolation, and the open island does not reach it.** The
-  game runs 30 steps a second and each is drawn twice. On the open island a pass
-  is about 5,150 draws and about 20 ms of the render thread, so two do not fit
-  in a thirtieth of a second: there the in-between frame is left out, the game
-  keeps its speed and the scene shows 30 frames a second. Keeping the step's
-  shadow maps for the in-between frame (2,739 of those draws) did reach 60, but
-  the in-between frame's shadow parameters do not match the kept maps: whole
-  surfaces went dark for a frame whenever the camera moved. It is off;
-  `WWHD_PS5_HOLD_SHADOWS=1` in `env.txt` turns it on for experiments.
-- **Nothing past the first island has been measured.** The game cannot run ahead of the render thread to make room
-  (tried: the render thread read a surface the game had reused), so a heavier
-  scene needs cheaper passes: the render thread spends about 3 microseconds a
-  draw (`ps5/src/sampler_ps5.cpp` has the profile).
+- **60 fps is frame interpolation, with some headroom.** The game runs 30
+  steps a second and each is drawn twice. On the first island's beach a pass is
+  about 5,800 draws and 13 ms of the render thread, which leaves it idle about
+  3.5 ms a frame; walking along the pier it is 10 to 11 ms. A heavier scene will
+  show 30 frames a second again (the in-between frame is left out and the game
+  keeps its speed) until passes get cheaper: the thread spends about 3.7
+  microseconds a draw, spread over the shader lookup, the uniforms, the
+  textures and the register writes ("How it works" below has what was cut;
+  `ps5/src/sampler_ps5.cpp` has the profiler). The game cannot run ahead of the
+  render thread to make room (tried: the render thread read a surface the game
+  had reused). Keeping the step's shadow maps for the in-between frame flickered
+  (their parameters do not match); `WWHD_PS5_HOLD_SHADOWS=1` in `env.txt` turns
+  that experiment on.
+- **Nothing past the first island has been measured.**
 - **Button symbols: the HUD and menus, in English.** The game prints a button's
   letter as text over a blank button, in the font of every other HUD label. The
   port prints those few texts as spare characters of that font and paints their
@@ -210,19 +211,67 @@ What the console needed, each found on it and explained where it is handled:
 - **In-between frames judged by their result.** Upstream's pacing times an
   in-between pass on the game's thread; here that measured one tick of the
   display while the render thread was still drawing, so the next step came
-  late and the game ran slow. The console's rule looks at the step instead:
-  three late steps in four stop the in-between frames, and a probe (every one
-  to four seconds) brings them back (`runtime/src/interp.cpp`, in the patch).
+  late and the game ran slow. The console's rule looks at the step instead: a
+  step more than 2 ms over its 33.3 ms counts as late (`WWHD_PS5_LATE_MS` in
+  `env.txt` changes that; at 6 ms a view just over budget ran the game at 93 to
+  97% speed with every frame drawn, and Gary preferred full speed at 30 fps for
+  those moments), three late steps in four stop the in-between frames, and a
+  probe every second brings them back as soon as the view fits again
+  (`WWHD_PS5_PROBE_S` sets the longest wait between probes; `runtime/src/interp.cpp`,
+  in the patch).
 - **Fewer, lazier submissions.** A submission is a system call on the render
   thread, and the game's GX2Flush and GX2DrawDone made two of the five a frame:
   their work goes with the next submission instead.
+- **The frame's copies on a helper thread.** For every draw the render thread
+  copied what it reads out of guest memory into the upload arena: 11 MiB a
+  frame of vertex and index ranges and uniform blocks. Now it only reserves the
+  arena bytes and a thread on a free core copies them (`ps5/src/copier_ps5.cpp`);
+  the render thread waits for it right before a GPU submission and before it
+  tells the game it has passed a fence, which is when anyone could read them.
+  `WWHD_PS5_ASYNC_COPY=0` turns it off.
+- **A host-cached upload arena.** The driver's first host-visible memory type is
+  uncached for the CPU, and every upload byte went through it, with a second,
+  cached copy kept for the reuse checks. The arena now takes a host-cached type
+  (the console's GPU reads it coherently) and the checks read the slices.
+  `WWHD_PS5_ARENA_CACHED=0` keeps the old type.
+- **Commands handed over in batches.** The game's thread issues about 46,000
+  commands a frame, 40,000 of them register writes, and each took the queue's
+  mutex and could wake the render thread with a system call. The game's main
+  thread now keeps them until it has 4 KiB or one the render thread must act on
+  at once; other threads hand over every command. `WWHD_PS5_BATCH_QUEUE=0`
+  restores one hand-over per command.
+- **A late frame flips when it is ready** (upstream's fix for its issue #125,
+  in v0.2.13: `runtime/src/gx2/vsync_pacing.h`; first backported here, now
+  upstream's own). The virtual vsync executed flips only on ticks of a 59.94 Hz
+  grid, so a frame ready a millisecond after its tick waited a whole tick, the
+  next step came late and the console's pacing rule dropped the in-between
+  frames: 45 of 60 drawn, in bursts. With it, every in-between frame is drawn on
+  the beach and the pier.
+- **A continued-draw fast path** (upstream's unmerged `vk-fastpath` branch,
+  commit 134617e, carried in the patch and on by default here; `WWHD_VK_FASTPATH=0`
+  turns it off, `WWHD_VK_FASTPATH_VERIFY=8` compares every eighth continued draw
+  with the full path and logs mismatches). Half the island's draws differ from
+  the one before only in constants and buffer pointers; such a draw reuses the
+  previous draw's shaders, render targets, pipeline and texture bindings
+  (`runtime/src/gx2/state_groups.h` says which registers end a run). 47 to 63%
+  of draws continued on the beach, a 100-second verify run found no mismatch,
+  and a pass went from 15 to 13 ms standing and from 11.5 to 10.5 ms walking.
+- **The game's code is built with `-fwrapv`** (upstream PR #172): PowerPC
+  integer arithmetic wraps, and the compiler now guarantees the same for the
+  recompiled code instead of relying on it never overflowing.
 
 ## Keeping up with upstream
 
 `vendor/wwhd` is a submodule at an upstream revision; nothing of it is copied or
 forked here. The console's changes are one patch, `ps5/patches/wwhd.patch`, each
-hunk behind `__PROSPERO__`. The Status table above is for the revision it was
-tested at (`5c39d48`, v0.2.12).
+hunk behind `__PROSPERO__` except one backport (the continued-draw fast path
+above, from upstream's unmerged `vk-fastpath` branch). The Status table above is
+for the revision it was tested at (`ad8bcff`, upstream's `devel` of 2026-10-13,
+120 commits after v0.2.13: it has the frame pacing fixes for upstream's issues
+#125 and #164, the controller fix for #153 and `-fwrapv` for the game code).
+After moving the submodule, run `ps5/tools/vm.sh prepare-game` again: the
+runtime's hooks into the game's code change between revisions, and a stale
+recompilation fails to link with undefined `f_..._orig` symbols.
 
 ## Credits
 

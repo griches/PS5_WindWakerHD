@@ -52,6 +52,10 @@ ps5_startup(void)
    /* the runtime writes its logs and captures relative to the working directory */
    (void)chdir("/app0/userdata"); /* refused for a title: the runtime names its folders in full */
 
+   /* the renderer's continued-draw fast path (upstream's vk-fastpath branch, in the patch): on, as
+    * the first island needs it for 60 fps; env.txt's WWHD_VK_FASTPATH=0 turns it off */
+   set("WWHD_VK_FASTPATH", "1", 0);
+
    FILE *file = fopen("/app0/env.txt", "r");
    if (file) {
       char line[512];

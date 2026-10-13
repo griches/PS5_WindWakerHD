@@ -1,8 +1,8 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 4ae364f..4a06f25 100644
+index 3dba70e..6001d88 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -141,6 +141,12 @@ elseif(ANDROID)
+@@ -166,6 +166,12 @@ elseif(ANDROID)
    list(APPEND RUNTIME_SOURCES runtime/src/platform/https_android.cpp)
  elseif(WIN32)
    list(APPEND RUNTIME_SOURCES runtime/src/platform/https_win.cpp)
@@ -11,11 +11,11 @@ index 4ae364f..4a06f25 100644
 +  list(APPEND RUNTIME_SOURCES ${PS5_PORT_DIR}/ps5/src/https_ps5.cpp ${PS5_PORT_DIR}/ps5/src/guestmem_ps5.cpp
 +       ${PS5_PORT_DIR}/ps5/src/ime_ps5.cpp ${PS5_PORT_DIR}/ps5/src/sampler_ps5.cpp
 +       ${PS5_PORT_DIR}/ps5/src/controller_ps5.cpp ${PS5_PORT_DIR}/ps5/src/threads_ps5.cpp
-+       ${PS5_PORT_DIR}/ps5/src/glyphs_ps5.cpp)
++       ${PS5_PORT_DIR}/ps5/src/glyphs_ps5.cpp ${PS5_PORT_DIR}/ps5/src/copier_ps5.cpp)
  elseif(UNIX AND NOT ANDROID)
    # libcurl is loaded at run time (dlopen); only its headers are needed. They are copied on their own:
    # their directory (e.g. /usr/include/x86_64-linux-gnu) also holds the system's glibc headers, which
-@@ -204,7 +210,7 @@ if(NOT TARGET ZLIB::ZLIB)
+@@ -235,7 +241,7 @@ if(NOT TARGET ZLIB::ZLIB)
    find_package(ZLIB REQUIRED)
  endif()
  find_package(Threads REQUIRED)
@@ -24,8 +24,27 @@ index 4ae364f..4a06f25 100644
    target_include_directories(wwhd PRIVATE ${WWHD_CURL_INCLUDE})
    target_link_libraries(wwhd PRIVATE ${CMAKE_DL_LIBS})
  endif()
+@@ -354,6 +360,10 @@ target_include_directories(language_source_test PRIVATE runtime/src runtime/incl
+ target_compile_options(language_source_test PRIVATE -UNDEBUG)
+ target_link_libraries(language_source_test PRIVATE ZLIB::ZLIB Threads::Threads)
+ 
++# register state groups of the Vulkan continued-draw fast path (runtime/src/gx2/state_groups.h)
++add_executable(state_groups_test runtime/tools/state_groups_test.cpp)
++target_include_directories(state_groups_test PRIVATE runtime/include runtime/src runtime/src/gx2 ${CEMU_DIR} ${CEMU_DIR}/Cafe ${CMAKE_SOURCE_DIR}/runtime/third_party/fmt/include)
++target_compile_options(state_groups_test PRIVATE "SHELL:-include ${CEMU_DIR}/cemu_shim.h" -UNDEBUG)
+ # controls mapping unit tests (runtime/src/input_map.cpp)
+ # performance report header: driver version decoding, OS names, overrides list (report_header.h)
+ add_executable(report_header_test runtime/tools/report_header_test.cpp runtime/src/report_header.cpp ${WWHD_BUILD_INFO})
+@@ -776,6 +786,7 @@ add_test(NAME write_watch COMMAND write_watch_test)
+ add_test(NAME buffer_cache COMMAND buffer_cache_test)
+ add_test(NAME snapshot_caches COMMAND snapshot_cache_test)
+ add_test(NAME pad_delivery COMMAND pad_delivery_test)
++add_test(NAME state_groups COMMAND state_groups_test)
+ add_test(NAME rumble COMMAND rumble_test)
+ add_test(NAME motion COMMAND motion_test)
+ add_test(NAME audio_output COMMAND audio_output_test)
 diff --git a/runtime/include/ppc.h b/runtime/include/ppc.h
-index 56ba99a..789b723 100644
+index 213fafb..d6f4532 100644
 --- a/runtime/include/ppc.h
 +++ b/runtime/include/ppc.h
 @@ -12,7 +12,8 @@
@@ -39,7 +58,7 @@ index 56ba99a..789b723 100644
     user address space (512 GiB), where 32 TiB is out of reach: stay well below it (64 GiB) */
  #define PPC_MEM_BASE ((uint8_t*)0x1000000000ull)
 diff --git a/runtime/src/core.cpp b/runtime/src/core.cpp
-index 5b1c562..9241240 100644
+index f861f54..9119bdc 100644
 --- a/runtime/src/core.cpp
 +++ b/runtime/src/core.cpp
 @@ -94,6 +94,9 @@ void fatal(const char* fmt, ...) {
@@ -80,7 +99,7 @@ index fbad62c..46b17c9 100644
  }
  } // namespace ss
 diff --git a/runtime/src/gfx/vulkan/api.h b/runtime/src/gfx/vulkan/api.h
-index 0038a6d..ad4d4fb 100644
+index 13da6cb..a2e9cd5 100644
 --- a/runtime/src/gfx/vulkan/api.h
 +++ b/runtime/src/gfx/vulkan/api.h
 @@ -24,6 +24,10 @@ void set_tv_format(uint32_t gx2Format, bool tv);
@@ -95,10 +114,66 @@ index 0038a6d..ad4d4fb 100644
  void write_back_linear_targets();  // GX2DrawDone: linear render targets to guest memory (surfaces.cpp)
  uint64_t frame_count();
 diff --git a/runtime/src/gfx/vulkan/backend.cpp b/runtime/src/gfx/vulkan/backend.cpp
-index 7ac593e..84523b5 100644
+index 9b00d41..ffd0fdf 100644
 --- a/runtime/src/gfx/vulkan/backend.cpp
 +++ b/runtime/src/gfx/vulkan/backend.cpp
-@@ -994,6 +994,18 @@ static void submit(VkSemaphore wait = VK_NULL_HANDLE,
+@@ -527,10 +527,35 @@ UploadSlice allocate_upload(VkDeviceSize size, VkDeviceSize alignment) {
+     auto result = slice(block);
+     if (result.buffer) return result;
+   }
++#ifdef __PROSPERO__
++  // PlayStation 5: the arena in host-cached memory where the driver has it. The console's memory is
++  // one pool the GPU reads coherently; the first host-visible type is uncached for the CPU, and
++  // every vertex, index and uniform byte of a frame (12 MiB on the first island) was written
++  // through it, with a second cached copy kept for the reuse checks. Cached, the copies go and the
++  // checks read the slices (R.uploadReadsDirect). WWHD_PS5_ARENA_CACHED=0 keeps the old type.
++  static const bool cachedArena = [] { const char* e = std::getenv("WWHD_PS5_ARENA_CACHED"); return !e || std::strcmp(e, "0") != 0; }();
++  if (R.uploadAllocations == 0) {
++    VkPhysicalDeviceMemoryProperties p;
++    vkGetPhysicalDeviceMemoryProperties(R.physicalDevice, &p);
++    for (uint32_t i = 0; i < p.memoryTypeCount; i++)
++      LOG("[vulkan] memory type %u: heap %u flags %s%s%s%s%s", i, p.memoryTypes[i].heapIndex,
++          p.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? "device-local " : "",
++          p.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT ? "host-visible " : "",
++          p.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT ? "coherent " : "",
++          p.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT ? "cached " : "",
++          p.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT ? "lazy " : "");
++  }
++  auto buffer = create_buffer(std::max<VkDeviceSize>(32ull<<20,size),
++      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
++      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
++      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
++      cachedArena ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0);
++#else
+   auto buffer = create_buffer(std::max<VkDeviceSize>(32ull<<20,size),
+       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++#endif
+   note_upload_block(buffer);
+   R.uploadBlocks.push_back({buffer,0});
+   ++R.uploadAllocations;
+@@ -1063,6 +1088,9 @@ static size_t next_submission_slot() {
+   resolve_retained_submission(R.submissions[next]);
+   return next;
+ }
++#ifdef __PROSPERO__
++extern "C" void ps5_copy_drain();  // ps5/src/copier_ps5.cpp
++#endif
+ static void submit(VkSemaphore wait = VK_NULL_HANDLE,
+                    VkSemaphore signal = VK_NULL_HANDLE, bool asynchronous=false) {
+   if (!R.recording)return;
+@@ -1118,6 +1146,9 @@ static void submit(VkSemaphore wait = VK_NULL_HANDLE,
+     if(snapshotSignal)signals[si.signalSemaphoreCount++]=snapshotSignal;
+ #endif
+     si.pWaitSemaphores=waits.data();si.pWaitDstStageMask=stages.data();si.pSignalSemaphores=signals.data();
++#ifdef __PROSPERO__
++    ps5_copy_drain();  // the GPU reads the upload slices from here on (ps5/src/copier_ps5.cpp)
++#endif
+     vk_check(timed_call(queueSubmitTiming,[&]{return vkQueueSubmit(R.queue,1,&si,slot.fence);}),"submit graphics");
+ #ifdef __ANDROID__
+     if(snapshotSignal && isolatedSecondary && isolatedSecondary->prepared()) {
+@@ -1135,6 +1166,18 @@ static void submit(VkSemaphore wait = VK_NULL_HANDLE,
      activate_submission(R.activeSubmission);
    }
  }
@@ -117,7 +192,7 @@ index 7ac593e..84523b5 100644
  void flush_async() {
    // Deferred objects may reference earlier queued work even if this slot has
    // no draw commands. Submit an empty command buffer to retire them in order.
-@@ -1022,7 +1034,11 @@ void wait_idle() {
+@@ -1164,7 +1207,11 @@ void wait_idle() {
  }
  void with_autorelease_pool(void (*fn)()) { host::with_autorelease_pool(fn); }
  uint64_t frames_completed() { return R.completed.load(); }
@@ -129,7 +204,7 @@ index 7ac593e..84523b5 100644
  static bool has_extension(const std::vector<VkExtensionProperties> &es,
                            const char *name) {
    return std::any_of(es.begin(), es.end(),
-@@ -2217,7 +2233,7 @@ static void frame_dumps(uint64_t frame) {
+@@ -2366,7 +2413,7 @@ static void frame_dumps(uint64_t frame) {
    if (captureRequested.exchange(false) || frame == scripted) {
      char dir[64];
      time_t t = time(nullptr);
@@ -138,7 +213,7 @@ index 7ac593e..84523b5 100644
      std::error_code ec;
      std::filesystem::create_directories(dir, ec);
      dump_scan(R.tv, std::string(dir) + "/tv.png");
-@@ -2246,6 +2262,18 @@ std::vector<Buffer> shotBuffersDone;
+@@ -2395,6 +2442,18 @@ std::vector<Buffer> shotBuffersDone;
  }  // namespace
  static void take_screenshots(const gfx::PresentPlan &plan) {
    std::string tvPath, drcPath;
@@ -157,10 +232,10 @@ index 7ac593e..84523b5 100644
    if (!R.tv.scan || !R.tv.scan->image || !screenshot::take(R.frame + 1, tvPath, drcPath))
      return;
    auto shoot = [&](Screen &s, const std::string &path, bool tv) {
-@@ -2445,7 +2473,11 @@ void swap() {
-   }
+@@ -2718,7 +2777,11 @@ void swap() {
    set_present_plan(nullptr);
    service_screenshots();  // this frame's: the submission that holds them
+   stutter::frame(R.frame);
 +#ifdef __cpp_lib_atomic_ref
    std::atomic_ref<uint64_t>(R.frame).fetch_add(1);
 +#else
@@ -169,7 +244,7 @@ index 7ac593e..84523b5 100644
    R.completed = R.frame;
  #ifdef __ANDROID__
    if (tvScan) drivers::frame_done();
-@@ -3583,10 +3615,17 @@ static void test_fullscreen_key() {
+@@ -3899,10 +3962,17 @@ static void test_fullscreen_key() {
  // Closing the TV window ends the game. SDL only sends SDL_EVENT_QUIT once every window is closed, so
  // with the GamePad window open the close button of the TV window did nothing. Closing the GamePad
  // window only hides it (WWHD_NO_GAMEPAD=1 starts without it).
@@ -179,7 +254,7 @@ index 7ac593e..84523b5 100644
  static void quit_game() {
    audio::finish_dump();  // _Exit bypasses atexit handlers
    screenshot::finish();  // the screenshots taken are written first
-   gx2::checkpoint_vulkan_caches();
+   gx2::shutdown_vulkan_caches();
 +#ifdef __PROSPERO__
 +  // PlayStation 5: a title never exits; it asks the shell to close it (ps5/src/platform.c)
 +  catchReturnFromMain(0);
@@ -188,10 +263,10 @@ index 7ac593e..84523b5 100644
  }
  static bool close_request(const SDL_Event& event) {
 diff --git a/runtime/src/gfx/vulkan/backend.h b/runtime/src/gfx/vulkan/backend.h
-index bf3841c..d4fd538 100644
+index 518aad8..0e7272d 100644
 --- a/runtime/src/gfx/vulkan/backend.h
 +++ b/runtime/src/gfx/vulkan/backend.h
-@@ -192,6 +192,14 @@ void save_pipeline_cache();
+@@ -205,6 +205,14 @@ void begin_pipeline_pending_frame();
  // Only guest GX2Flush uses this asynchronous path. flush() remains a drain for
  // readbacks and renderer tools; final presentation also waits synchronously.
  void flush_async();
@@ -206,8 +281,26 @@ index bf3841c..d4fd538 100644
  void reset_pipeline_lookup_cache();
  uint64_t draw_batch_submissions();
  void vk_check(VkResult result,const char* operation);
+@@ -255,7 +263,16 @@ enum class DepthCopyOverride { None, Draw, Unsupported };
+ extern DepthCopyOverride g_depthCopyOverride;
+ float res_scale();void set_res_scale(float);void latch_res_scale();
+ uint64_t next_write_seq();
+-inline void mark_gpu_written(Surface* s){s->gpuWritten=true;s->writeSeq=next_write_seq();}
++// Surface epoch (surfaces.cpp): bumped whenever the result of a texture or render-target lookup
++// (find_or_create_surface, sampled views, sampler choice) or the content of a sampled CPU texture can
++// change without a register write: surfaces created or their images destroyed/replaced, CPU texture
++// uploads, GPU writes outside the draw's own targets (clears, copies), CPU copies, save-state resets.
++// The continued-draw fast path (draw.cpp) reuses resolved state only within one epoch.
++extern uint64_t g_surface_epoch;
++inline void mark_gpu_written(Surface* s){s->gpuWritten=true;s->writeSeq=next_write_seq();++g_surface_epoch;}
++// A draw's own attachments: their newer writeSeq can only change lookups at their own addresses,
++// which the fast path excludes (draw.cpp); a surface becoming GPU-written still ends the epoch.
++inline void mark_draw_target_written(Surface* s){if(!s->gpuWritten)++g_surface_epoch;s->gpuWritten=true;s->writeSeq=next_write_seq();}
+ }
+ 
+ namespace gfxvk { void reset_feedback_images(); } // Call before device teardown, then drain retirements.
 diff --git a/runtime/src/gfx/vulkan/backend_table.cpp b/runtime/src/gfx/vulkan/backend_table.cpp
-index c35350b..4598941 100644
+index d51fbac..1bb1743 100644
 --- a/runtime/src/gfx/vulkan/backend_table.cpp
 +++ b/runtime/src/gfx/vulkan/backend_table.cpp
 @@ -57,7 +57,11 @@ const Backend& vulkan_backend() {
@@ -223,10 +316,18 @@ index c35350b..4598941 100644
          b.write_back = gfxvk::write_back_linear_targets;
          b.ss_reset = [] {
 diff --git a/runtime/src/gfx/vulkan/draw.cpp b/runtime/src/gfx/vulkan/draw.cpp
-index 0f676e1..2efaccf 100644
+index 79e67a5..a6c9b22 100644
 --- a/runtime/src/gfx/vulkan/draw.cpp
 +++ b/runtime/src/gfx/vulkan/draw.cpp
-@@ -18,7 +18,12 @@
+@@ -10,6 +10,7 @@
+ #include "backend.h"
+ #include "deferred_dispatch.h"
+ #include "buffer_cache.h"
++#include "gx2/state_groups.h"
+ #include "render_prof.h"
+ #include "runtime.h"
+ #include "shaders.h"
+@@ -24,7 +25,12 @@
  #include "index_conversion.h"
  #include "vertex_history.h"
  #include "vertex_snapshot_history.h"
@@ -239,7 +340,7 @@ index 0f676e1..2efaccf 100644
  #include <array>
  #include <cmath>
  #include <chrono>
-@@ -41,6 +46,11 @@ bool preparation_stats_enabled() {
+@@ -48,6 +54,11 @@ bool preparation_stats_enabled() {
  // Bounded overlap: the default on every platform (measured on macOS and Windows); an explicit
  // zero/invalid WWHD_VK_DRAW_BATCH disables it.
  uint32_t parse_draw_batch(const char* text) {
@@ -251,7 +352,30 @@ index 0f676e1..2efaccf 100644
    if (!text) return 2048;
    if (!*text) return 0;
    uint32_t value = 0;
-@@ -131,6 +141,84 @@ UploadSlice snapshot(const void *data, size_t size, VkDeviceSize alignment) {
+@@ -123,6 +134,22 @@ float f32(uint32_t v) {
+   std::memcpy(&f, &v, 4);
+   return f;
+ }
++#ifdef __PROSPERO__
++} // namespace
++// PlayStation 5: the frame's copies out of guest memory are made by a helper thread
++// (ps5/src/copier_ps5.cpp); the render thread only reserves the slice. The bytes are complete before
++// the next submission (backend.cpp) and before the game is told the render thread passed a fence
++// (gx2_core.cpp). Only for guest memory: a CPU scratch buffer may be rewritten by the next draw.
++extern "C" bool ps5_copy_async_enabled();
++extern "C" void ps5_copy_async(void* dst, const void* src, size_t size, size_t zero);
++namespace {
++UploadSlice snapshot_guest(const void *data, size_t size, VkDeviceSize alignment) {
++  auto slice = allocate_upload(std::max<size_t>(size, 16), alignment);
++  if (data && size) ps5_copy_async(slice.mapped, data, size, slice.size > size ? slice.size - size : 0);
++  else std::memset(slice.mapped, 0, slice.size);
++  return slice;
++}
++#endif
+ UploadSlice snapshot(const void *data, size_t size, VkDeviceSize alignment) {
+   auto slice = allocate_upload(std::max<size_t>(size, 16), alignment);
+   // Every allocation owns its bytes until the submission fence completes.
+@@ -138,6 +165,84 @@ UploadSlice snapshot(const void *data, size_t size, VkDeviceSize alignment) {
    return slice;
  }
  
@@ -336,10 +460,495 @@ index 0f676e1..2efaccf 100644
  UploadSlice vertex_snapshot(uint32_t binding, uint32_t address, uint32_t size,
                              bool bounded) {
    static const bool enabled = [] {
-@@ -1825,12 +1913,49 @@ UploadSlice vertex_window_smoke_snapshot(uint32_t binding,uint32_t address,
- void reset_ao_private_cache() { aoPrivateFrame = ~0ull; aoPrivateSource = 0; }
- void reset_pipeline_lookup_cache() { lastPipelineLookup = {}; pipelineLookaside = {}; samplerMemo = {}; drawBatchState = {}; }
+@@ -161,6 +266,10 @@ UploadSlice vertex_snapshot(uint32_t binding, uint32_t address, uint32_t size,
+       }
+     }
+   }
++#ifdef __PROSPERO__
++  if (ps5_copy_async_enabled())
++    return snapshot_guest(mem::ptr(address), size, 4);
++#endif
+   if (!enabled)
+     return snapshot(mem::ptr(address), size, 4);
+   static const bool historyEnabled = [] {
+@@ -232,6 +341,16 @@ UploadSlice vertex_window_snapshot(uint32_t binding,uint32_t address,uint32_t re
+     return e && !std::strcmp(e,"1");}();
+   Entry* entry=reuse && binding<entries.size()?&entries[binding]:nullptr;
+   const auto* fresh=static_cast<const uint8_t*>(source?source:mem::ptr(address))+begin;
++#ifdef __PROSPERO__
++  if(!source && ps5_copy_async_enabled()) {
++    auto slice=allocate_upload(std::max<uint32_t>(reservation,16),4);
++    if(poisonUnused) std::memset(slice.mapped,0xCD,slice.size);
++    ps5_copy_async(static_cast<uint8_t*>(slice.mapped)+begin,fresh,length,0);
++    if(slice.size>reservation)
++      std::memset(static_cast<uint8_t*>(slice.mapped)+reservation,0,slice.size-reservation);
++    return slice;
++  }
++#endif
+   // compares the entry's CPU copy of the window, not the mapped slice, unless the entry was made with
+   // direct reads (host-cached upload memory; vertex_snapshot_history.h)
+   if(entry && entry->matches(address,reservation,begin,length)) {
+@@ -1697,10 +1816,256 @@ VkImageView feedback_view(Surface *source, const uint32_t *textureWords,
+   destroy_surface_image(&temporary); // Temporary snapshots remain fence-retired.
+   return view;
+ }
++// ---------------------------------------------------------------- continued-draw fast path
++// WWHD_VK_FASTPATH=1: while only "continued" register groups changed since the previous resolved
++// draw (gx2/state_groups.h: ALU constants, uniform-block and vertex-buffer pointers, per-draw
++// dynamic words), in the same frame and surface epoch (backend.h), with the same primitive type and
++// graphics settings, a draw reuses that draw's fetch/vertex/pixel shaders, render targets, pipeline
++// and texture/sampler bindings (Cemu's continued draw pass: LatteCommandProcessor.cpp,
++// VulkanRendererCore.cpp). Uniforms, support uniforms (incl. texture scales), descriptor sets,
++// indices, vertex buffers and dynamic state are still prepared per draw, and every reused texture
++// still goes through upload_surface (write tracking/invalidations): an upload ends the epoch and the
++// draw resolves fully. Draws that sample one of their own targets' addresses (feedback loops and
++// lookups whose winner can change with the target's write sequence), AO replays and AO-substituted
++// textures are never continued.
++// WWHD_VK_FASTPATH_VERIFY=N (implies WWHD_VK_FASTPATH=1 unless it is 0): on every Nth continued draw
++// also run the full resolution, compare shaders, targets, pipeline and texture/sampler bindings,
++// count and log mismatches (the draw then uses the full result). Statistics every 120 frames.
++struct FastPathConfig {
++  bool on = false;
++  uint32_t verifyEvery = 0;
++};
++const FastPathConfig& fastpath_config() {
++  static const FastPathConfig config = [] {
++    FastPathConfig c;
++    if (const char* v = std::getenv("WWHD_VK_FASTPATH_VERIFY")) c.verifyEvery = uint32_t(std::max(0, std::atoi(v)));
++    const char* e = std::getenv("WWHD_VK_FASTPATH");
++    c.on = e ? std::atoi(e) != 0 : c.verifyEvery != 0;
++    if (!c.on) c.verifyEvery = 0;
++    if (c.on) LOG("[vulkan] continued-draw fast path on%s", c.verifyEvery ? " (verify mode)" : "");
++    return c;
++  }();
++  return config;
++}
++struct ContinuedTexture {
++  uint32_t unit = 0;
++  int binding = -1;
++  Surface* surface = nullptr;
++  VkImageView view = VK_NULL_HANDLE;
++  VkSampler sampler = VK_NULL_HANDLE;
++};
++struct ContinuedStage {
++  uint32_t count = 0;
++  bool continuable = true;
++  std::array<ContinuedTexture, LATTE_NUM_MAX_TEX_UNITS> textures{};
++  void add(const ContinuedTexture& t) {
++    if (count < textures.size()) textures[count++] = t;
++    else continuable = false;
++  }
++};
++struct DrawTargets {
++  std::array<Surface*, 8> colors{};
++  std::array<uint32_t, 8> slices{};
++  Surface* depth = nullptr;
++  uint32_t depthSlice = 0, width = 0, height = 0;
++  float sx = 1, sy = 1;
++  bool same(const DrawTargets& o) const {
++    return colors == o.colors && slices == o.slices && depth == o.depth && depthSlice == o.depthSlice &&
++           width == o.width && height == o.height && !std::memcmp(&sx, &o.sx, 4) && !std::memcmp(&sy, &o.sy, 4);
++  }
++};
++enum ContinuedReason : uint8_t {
++  kContinued, kNoState, kNewFrame, kRegisters, kSurfaces, kUpload, kPrimitive, kSettings,
++  kVerifyMismatch, kNotContinuable, kAoReplay, kReasons
++};
++const char* const continuedReasonNames[kReasons] = {
++  "continued", "no state", "new frame", "registers", "surfaces", "texture upload", "primitive",
++  "settings", "verify mismatch", "not continuable", "AO replay"};
++struct ContinuedDraw {
++  bool valid = false;
++  ContinuedReason invalidReason = kNoState;  // why the state is not valid
++  uint64_t stateVersion = 0, surfaceEpoch = 0, frame = ~uint64_t{0};
++  uint32_t prim = 0;
++  VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
++  int aoMode = 0;
++  bool aoHires = false, aniso = false;
++  LatteFetchShader* fs = nullptr;
++  uint64_t fsKey = 0;
++  vk::Shader *vs = nullptr, *ps = nullptr;
++  DrawTargets targets;
++  Pipeline* pipeline = nullptr;
++  ContinuedStage stages[2];
++};
++ContinuedDraw continued;
++struct ContinuedStats {
++  uint64_t lastFrame = 0, draws = 0, verified = 0, mismatches = 0, totalMismatches = 0, totalVerified = 0;
++  std::array<uint64_t, kReasons> reasons{};
++  std::array<uint64_t, gx2::kSgCount> groups{};  // register groups that ended a continuation
++  std::array<uint64_t, 8> mismatchKinds{};
++} continuedStats;
++const char* const mismatchKindNames[8] = {"fetch shader", "vertex shader", "pixel shader", "targets",
++                                          "pipeline", "texture count", "texture binding", "topology"};
++void report_continued_stats() {
++  auto& st = continuedStats;
++  if (R.frame < st.lastFrame + 120) return;
++  const double frames = double(R.frame - st.lastFrame);
++  if (st.draws) {
++    char buf[1024];
++    int k = std::snprintf(buf, sizeof buf, "[vulkan fastpath] frame %llu: %.1f%% of %.0f draws/frame continued; full:",
++                          (unsigned long long)R.frame, 100.0 * st.reasons[kContinued] / st.draws, st.draws / frames);
++    for (int i = 1; i < kReasons && k < int(sizeof buf); ++i)
++      if (st.reasons[i]) k += std::snprintf(buf + k, sizeof buf - k, " %s %.1f%%", continuedReasonNames[i], 100.0 * st.reasons[i] / st.draws);
++    if (st.reasons[kRegisters] && k < int(sizeof buf)) {
++      k += std::snprintf(buf + k, sizeof buf - k, "; groups/frame:");
++      for (int g = 0; g < gx2::kSgCount && k < int(sizeof buf); ++g)
++        if (st.groups[g]) k += std::snprintf(buf + k, sizeof buf - k, " %s %.0f", gx2::state_group_name(g), st.groups[g] / frames);
++    }
++    if (fastpath_config().verifyEvery && k < int(sizeof buf))
++      k += std::snprintf(buf + k, sizeof buf - k, "; verify: %llu checked, %llu mismatches (total %llu of %llu)",
++                         (unsigned long long)st.verified, (unsigned long long)st.mismatches,
++                         (unsigned long long)st.totalMismatches, (unsigned long long)st.totalVerified);
++    LOG("%s", buf);
++  }
++  const uint64_t totalMismatches = st.totalMismatches, totalVerified = st.totalVerified;
++  const auto kinds = st.mismatchKinds;
++  st = {};
++  st.lastFrame = R.frame;
++  st.totalMismatches = totalMismatches;
++  st.totalVerified = totalVerified;
++  st.mismatchKinds = kinds;
++}
++// Render targets of a draw (both paths); false: the draw has no target.
++#ifdef __PROSPERO__
++static bool ps5HoldPass = false;      // the in-between pass's shadow maps are the step's (below)
++static uint32_t ps5ShadowDepth = 0;
++#endif
++bool resolve_targets(const uint32_t* r, vk::Shader* ps, DrawTargets& t) {
++  t = {};
++  const auto &lcr = *reinterpret_cast<const LatteContextRegister *>(r);
++  auto mask = LatteMRT::GetActiveColorBufferMask(ps->dec, lcr);
++  for (int i = 0; i < 8; i++)
++    if (mask & (1 << i))
++      t.colors[i] = color_target(r, i, &t.slices[i]);
++  t.depth = LatteMRT::GetActiveDepthBufferMask(lcr) ? depth_target(r, &t.depthSlice) : nullptr;
++  auto& colors = t.colors;
++  auto& depth = t.depth;
++  if (depth && depth->width == 1280 && depth->height == 720) R.mainDepthAddr = depth->addr;
++#ifdef __PROSPERO__
++  if (!ps5HoldPass && depth && !mask && r[gx2::kDepthSlicesReg] > 1) ps5ShadowDepth = depth->addr;  // the shadow maps (below)
++  {
++    // debug (WWHD_PS5_DRAW_TARGETS=1): how a frame's draws divide between its render targets
++    static const bool on = [] { const char* e = std::getenv("WWHD_PS5_DRAW_TARGETS"); return e && *e && std::strcmp(e, "0") != 0; }();
++    if (on) {
++      struct Key { uint32_t color, depth, w, h, slice; bool operator<(const Key& o) const { return std::tie(color, depth, w, h, slice) < std::tie(o.color, o.depth, o.w, o.h, o.slice); } };
++      static std::map<Key, uint32_t> counts;
++      static uint64_t since = R.frame;
++      const Surface* any = colors[0] ? colors[0] : depth;
++      ++counts[{colors[0] ? colors[0]->addr : 0, depth ? depth->addr : 0, any ? any->width : 0, any ? any->height : 0, colors[0] ? t.slices[0] : t.depthSlice}];
++      if (R.frame - since >= 600) {
++        const double frames = double(R.frame - since);
++        std::vector<std::pair<uint32_t, Key>> order;
++        for (auto& [k, n] : counts) order.push_back({n, k});
++        std::sort(order.begin(), order.end(), [](auto& x, auto& y) { return x.first > y.first; });
++        for (size_t i = 0; i < order.size() && i < 14; i++)
++          LOG("[targets] %7.1f draws/frame: colour %08X depth %08X %ux%u slice %u", order[i].first / frames, order[i].second.color,
++              order[i].second.depth, order[i].second.w, order[i].second.h, order[i].second.slice);
++        counts.clear();
++        since = R.frame;
++      }
++    }
++  }
++#endif
++  const uint32_t guestWidth = colors[0] ? colors[0]->width : 0;
++  const uint32_t guestHeight = colors[0] ? colors[0]->height : 0;
++  if (aoPrivateReplay && colors[0]) {
++    aoPrivateSource = colors[0]->addr;
++    colors[0] = private_ao_surface(aoPrivateColor, colors[0]);
++    t.slices[0] = 0;
++    if (depth) {
++      depth = private_ao_surface(aoPrivateDepth, depth);
++      t.depthSlice = 0;
++    }
++  }
++  Surface *target = depth;
++  for (auto *c : colors)
++    if (c) {
++      target = c;
++      break;
++    }
++  if (!target)
++    return false;
++  t.width = target->extent.width;
++  t.height = target->extent.height;
++  t.sx = target->sx;
++  t.sy = target->sy;
++  if (aoPrivateReplay && guestWidth) {
++    // the viewport registers describe the game's smaller buffer (x and y differ at other aspect ratios)
++    t.sx = float(colors[0]->extent.width) / guestWidth;
++    t.sy = guestHeight ? float(colors[0]->extent.height) / guestHeight : t.sx;
++  }
++  for (auto *&c : colors)
++    if (c && (c->extent.width != t.width || c->extent.height != t.height)) {
++      if (aoPrivateReplay) c = nullptr;
++      else exception_report::raise("mismatched Vulkan attachments");
++    }
++  if (depth && (depth->extent.width < t.width || depth->extent.height < t.height))
++    depth = nullptr;
++  return true;
++}
++// A sampled texture of a stage (both paths): lookup, AO substitution and the write-tracking check.
++// substituted: the private AO image replaced the guest texture.
++Surface* resolve_texture(const uint32_t* r, vk::Shader* sh, uint32_t unit, bool* substituted = nullptr) {
++  const uint32_t texbase = sh->vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS;
++  auto *s = sampled_texture(r + texbase + unit * 7, sh->dec->textureUsesDepthCompare[unit]);
++  if (!s)
++    exception_report::raise("missing sampled texture");
++  if (!sh->vertex && ao_hires_enabled() && aoPrivateSource &&
++      s->addr == aoPrivateSource && aoPrivateFrame == R.frame &&
++      sh->kind == gfx::ProgramKind::OcclusionPixel) {
++    s = &aoPrivateColor;
++    if (substituted) *substituted = true;
++  }
++  upload_surface(s);
++  return s;
++}
++bool aliases_target(const Surface* s, const std::array<Surface*, 8>& colors, const Surface* depth) {
++  bool aliases = depth && s->image == depth->image;
++  for (auto *color : colors)
++    if (color && s->image == color->image)
++      aliases = true;
++  return aliases;
++}
++// a lookup at one of the draw's own target addresses can pick another surface once the target's
++// write sequence advances (find_or_create_surface): such textures are not continued
++bool shares_target_address(const Surface* s, const std::array<Surface*, 8>& colors, const Surface* depth) {
++  if (depth && depth->addr == s->addr) return true;
++  for (auto *color : colors)
++    if (color && color->addr == s->addr) return true;
++  return false;
++}
++VkSampler resolve_sampler(const uint32_t* r, vk::Shader* sh, uint32_t unit, const Surface* s) {
++  uint32_t samplerId = sh->dec->textureUnitSamplerAssignment[unit];
++  if (samplerId >= 18)
++    exception_report::raise("missing texture sampler");
++  uint32_t samplerBase = sh->vertex ? 18 : 0;
++  const uint32_t* samplerWords = r + REGADDR::SQ_TEX_SAMPLER_WORD0_0 +
++                                  (samplerBase + samplerId) * 3;
++  uint32_t patchedSampler[3];
++  if (!sh->vertex && ao_mode() >= 1 && unit == 0 &&
++      sh->kind == gfx::ProgramKind::OcclusionPixel) {
++    memcpy(patchedSampler, samplerWords, sizeof patchedSampler);
++    patchedSampler[0] = (patchedSampler[0] & ~0x7E00u) | (1u << 9) | (1u << 12);
++    samplerWords = patchedSampler;
++  }
++  return sampler(samplerWords, sh->dec->textureUsesDepthCompare[unit],
++                 s->fmt.kind != FormatInfo::FLOAT,
++                 !s->gpuWritten && s->mips > 1);
++}
+ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+                           VkDescriptorSetLayout layout, bool dynamicUniforms, float sx, float sy,
+                           const std::array<Surface *, 8> &colors,
+-                          Surface *depth, FeedbackStatsProbe* feedbackProbe) {
++                          Surface *depth, FeedbackStatsProbe* feedbackProbe,
++                          const ContinuedStage* reuse = nullptr, ContinuedStage* record = nullptr) {
+   StageResources out;
+   auto &m = sh->mapping;
+   // Descriptor info pointers must remain stable until this stage's one update.
+@@ -1759,7 +2124,15 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+     UploadSlice cachedSlice;
+     const bool cached = guestAddr && buffer_cache_enabled() &&
+         cached_guest_range(guestAddr, uint32_t(size), rprof::kUpUbo, cachedSlice);
++#ifdef __PROSPERO__
++    const bool guestAsync = !cached && guestAddr && ps5_copy_async_enabled();
++#else
++    const bool guestAsync = false;
++#endif
+     const auto b = cached ? cachedSlice
++#ifdef __PROSPERO__
++        : guestAsync ? snapshot_guest(bytes, size, R.properties.limits.minUniformBufferOffsetAlignment)
++#endif
+         : reuseUniforms
+         ? uniformCache.get(R.device, R.submissionGeneration,
+                            (sh->vertex ? 0 : 17) + logicalSlot, bytes, size,
+@@ -1840,6 +2213,32 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+   rprof::mark(rprof::kUniforms);
+   uint32_t texbase = sh->vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS
+                                 : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS;
++  auto bindTexture = [&](uint32_t unit, int binding, Surface* s, VkImageView view, VkSampler samplerValue) {
++    int scaleOffset = sh->uniforms.offset_texScale[unit];
++    if (scaleOffset >= 0 && size_t(scaleOffset) + 8 <= supportUniforms.size()) {
++      const float scale[] = {s->sx, s->sy};
++      memcpy(supportUniforms.data() + scaleOffset, scale, sizeof scale);
++    }
++    if (imageCount >= imageInfos.size())
++      exception_report::raise("stage image descriptor capacity exceeded");
++    auto &info = imageInfos[imageCount++];
++    info = {samplerValue, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
++    auto &write = appendWrite(rankPlan.textures[unit]);
++    write.dstBinding = binding;
++    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++    write.pImageInfo = &info;
++  };
++  if (reuse) {
++    // continued draw: the previous draw's textures (upload_surface already ran for this draw)
++    for (uint32_t i = 0; i < reuse->count; ++i) {
++      const auto& t = reuse->textures[i];
++      transition_image(t.surface, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++                       VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
++                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
++                       VK_ACCESS_SHADER_READ_BIT);
++      bindTexture(t.unit, t.binding, t.surface, t.view, t.sampler);
++    }
++  } else
+   for (int i = 0; i < sh->dec->textureUnitListCount; i++) {
+     uint32_t unit = sh->dec->textureUnitList[i];
+     if (unit >= LATTE_NUM_MAX_TEX_UNITS)
+@@ -1847,24 +2246,9 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+     int binding = m.textureUnitToBindingPoint[unit];
+     if (binding < 0)
+       continue;
+-    auto *s = sampled_texture(r + texbase + unit * 7,
+-                              sh->dec->textureUsesDepthCompare[unit]);
+-    if (!s)
+-      exception_report::raise("missing sampled texture");
+-    if (!sh->vertex && ao_hires_enabled() && aoPrivateSource &&
+-        s->addr == aoPrivateSource && aoPrivateFrame == R.frame &&
+-        sh->kind == gfx::ProgramKind::OcclusionPixel)
+-      s = &aoPrivateColor;
+-    upload_surface(s);
+-    int scaleOffset = sh->uniforms.offset_texScale[unit];
+-    if (scaleOffset >= 0 && size_t(scaleOffset) + 8 <= supportUniforms.size()) {
+-      const float scale[] = {s->sx, s->sy};
+-      memcpy(supportUniforms.data() + scaleOffset, scale, sizeof scale);
+-    }
+-    bool aliases = depth && s->image == depth->image;
+-    for (auto *color : colors)
+-      if (color && s->image == color->image)
+-        aliases = true;
++    bool substituted = false;
++    Surface* s = resolve_texture(r, sh, unit, &substituted);
++    bool aliases = aliases_target(s, colors, depth);
+     VkImageView sampledView =
+         aliases ? feedback_view(s, r + texbase + unit * 7, sh->vertex, unit, feedbackProbe)
+                 : sampled_texture_view(s, r + texbase + unit * 7);
+@@ -1876,31 +2260,12 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+                            : (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT),
+                        VK_ACCESS_SHADER_READ_BIT);
+-    uint32_t samplerId = sh->dec->textureUnitSamplerAssignment[unit];
+-    if (samplerId >= 18)
+-      exception_report::raise("missing texture sampler");
+-    uint32_t samplerBase = sh->vertex ? 18 : 0;
+-    if (imageCount >= imageInfos.size())
+-      exception_report::raise("stage image descriptor capacity exceeded");
+-    auto &info = imageInfos[imageCount++];
+-    const uint32_t* samplerWords = r + REGADDR::SQ_TEX_SAMPLER_WORD0_0 +
+-                                    (samplerBase + samplerId) * 3;
+-    uint32_t patchedSampler[3];
+-    if (!sh->vertex && ao_mode() >= 1 && unit == 0 &&
+-        sh->kind == gfx::ProgramKind::OcclusionPixel) {
+-      memcpy(patchedSampler, samplerWords, sizeof patchedSampler);
+-      patchedSampler[0] = (patchedSampler[0] & ~0x7E00u) | (1u << 9) | (1u << 12);
+-      samplerWords = patchedSampler;
+-    }
+-    info = {sampler(samplerWords, sh->dec->textureUsesDepthCompare[unit],
+-                   s->fmt.kind != FormatInfo::FLOAT,
+-                   !s->gpuWritten && s->mips > 1),
+-                             sampledView,
+-                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+-    auto &write = appendWrite(rankPlan.textures[unit]);
+-    write.dstBinding = binding;
+-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+-    write.pImageInfo = &info;
++    VkSampler samplerValue = resolve_sampler(r, sh, unit, s);
++    bindTexture(unit, binding, s, sampledView, samplerValue);
++    if (record) {
++      if (aliases || substituted || shares_target_address(s, colors, depth)) record->continuable = false;
++      record->add({unit, binding, s, sampledView, samplerValue});
++    }
+   }
+   rprof::mark(rprof::kTextures);
+   if (m.uniformVarsBufferBindingPoint >= 0)
+@@ -1963,6 +2328,74 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+   remember_descriptors(last, layout, out.set, writes.data(), writeCount);
+   return out;
+ }
++// WWHD_VK_FASTPATH_VERIFY: the full resolution of a continued draw, compared with the reused state
++bool verify_continued(const uint32_t* r, uint32_t prim) {
++  const auto& c = continued;
++  int kind = -1;
++  char detail[200] = "";
++  uint64_t fsKey = 0;
++  auto* fs = vk::get_fetch_shader(r, &fsKey, R.frame);
++  vk::Shader* vs = fs ? vk::translate(r, true, fs, fsKey, R.frame, g_shader_state_gen) : nullptr;
++  vk::Shader* ps = fs ? vk::translate(r, false, fs, fsKey, R.frame, g_shader_state_gen) : nullptr;
++  DrawTargets t;
++  if (fs != c.fs || fsKey != c.fsKey) kind = 0;
++  else if (vs != c.vs || !vs || !vs->ready()) kind = 1;
++  else if (ps != c.ps || !ps || !ps->ready()) kind = 2;
++  else if (primitive_topology(prim) != c.topology) kind = 7;
++  else if (!resolve_targets(r, ps, t) || !t.same(c.targets)) kind = 3;
++  else if (&pipeline(r, vs, ps, fs, c.topology, t.colors, t.depth) != c.pipeline) kind = 4;
++  else
++    for (int stage = 0; stage < 2 && kind < 0; ++stage) {
++      vk::Shader* sh = stage ? ps : vs;
++      const auto& cs = c.stages[stage];
++      const uint32_t texbase = sh->vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS;
++      uint32_t n = 0;
++      for (int i = 0; i < sh->dec->textureUnitListCount && kind < 0; i++) {
++        const uint32_t unit = sh->dec->textureUnitList[i];
++        if (unit >= LATTE_NUM_MAX_TEX_UNITS) { kind = 6; break; }
++        const int binding = sh->mapping.textureUnitToBindingPoint[unit];
++        if (binding < 0) continue;
++        if (n >= cs.count) { kind = 5; break; }
++        const auto& e = cs.textures[n++];
++        Surface* s = resolve_texture(r, sh, unit);
++        const bool aliases = aliases_target(s, t.colors, t.depth);
++        VkImageView view = aliases ? VK_NULL_HANDLE : sampled_texture_view(s, r + texbase + unit * 7);
++        VkSampler smp = resolve_sampler(r, sh, unit, s);
++        if (e.unit != unit || e.binding != binding || e.surface != s || aliases || view != e.view || smp != e.sampler) {
++          kind = 6;
++          std::snprintf(detail, sizeof detail, " (%s unit %u: surface %08X%s/%08X, view %s, sampler %s%s)",
++                        stage ? "ps" : "vs", unit, s->addr, e.surface == s ? "" : " (cached differs)",
++                        e.surface ? e.surface->addr : 0, view == e.view ? "same" : "differs",
++                        smp == e.sampler ? "same" : "differs", aliases ? ", aliases a target" : "");
++        }
++      }
++      if (kind < 0 && n != cs.count) kind = 5;
++    }
++  if (kind < 0) return true;
++  auto& st = continuedStats;
++  ++st.mismatches;
++  ++st.totalMismatches;
++  ++st.mismatchKinds[kind];
++  static int logged = 0;
++  if (logged < 50) {
++    ++logged;
++    LOG("[vulkan fastpath] verify mismatch #%llu: %s%s; frame %llu draw %llu prim %u vs %08X ps %08X fs %08X",
++        (unsigned long long)st.totalMismatches, mismatchKindNames[kind], detail, (unsigned long long)R.frame,
++        (unsigned long long)R.drawCount, prim, r[mmSQ_PGM_START_VS] << 8, r[mmSQ_PGM_START_PS] << 8,
++        r[mmSQ_PGM_START_FS] << 8);
++  }
++  return false;
++}
++ContinuedReason continued_reason(uint32_t prim) {
++  const auto& c = continued;
++  if (!c.valid) return c.invalidReason;
++  if (c.frame != R.frame) return kNewFrame;
++  if (c.stateVersion != gx2::g_full_state_version) return kRegisters;
++  if (c.surfaceEpoch != g_surface_epoch) return kSurfaces;
++  if (c.prim != prim) return kPrimitive;
++  if (c.aoMode != ao_mode() || c.aoHires != ao_hires_enabled() || c.aniso != aniso_enabled()) return kSettings;
++  return kContinued;
++}
+ } // namespace
+ void reset_feedback_images() { reset_feedback_scratch(); }
+ UploadSlice vertex_window_smoke_snapshot(uint32_t binding,uint32_t address,
+@@ -1979,7 +2412,7 @@ void reset_ao_private_cache() { aoPrivateFrame = ~0ull; aoPrivateSource = 0; }
+ void drain_pending_guest_pipelines() {
+   for (auto& [key, value] : pipelines) resolve_pending_pipeline(value);
+ }
+-void reset_pipeline_lookup_cache() { lastPipelineLookup = {}; pipelineLookaside = {}; samplerMemo = {}; drawBatchState = {}; }
++void reset_pipeline_lookup_cache() { lastPipelineLookup = {}; pipelineLookaside = {}; samplerMemo = {}; drawBatchState = {}; continued = {}; }
  uint64_t draw_batch_submissions() { return drawBatchSubmissions; }
+ // WWHD_VK_TRACE_PASSES=1 (issue #144): log each new render pass shape once, just before the driver
+ // sees it, so a crash inside vkCmdBeginRendering names the last pass in the crash report's log lines
+@@ -2008,20 +2441,97 @@ static void trace_pass(const std::array<Surface *, 8> &colors, uint32_t ncolor,
+             (depth->fmt.stencil ? "/stencil" : "");
+   LOG("[vulkan pass] %ux%u, %u colour attachment(s)%s", width, height, ncolor, text.c_str());
+ }
 +#ifdef __PROSPERO__
 +// PlayStation 5: in-between frames keep the step's shadow maps.
 +//
@@ -353,8 +962,6 @@ index 0f676e1..2efaccf 100644
 +// left out: the maps of the step's first pass stay, 16 ms old for what moved. The array is the one
 +// the last full pass drew into without a colour target (ps5ShadowDepth); which kind of pass this
 +// is comes from the swap before it (gx2_core.cpp). WWHD_PS5_HOLD_SHADOWS=1 turns this on.
-+static bool ps5HoldPass = false;
-+static uint32_t ps5ShadowDepth = 0;
 +static uint64_t ps5ShadowSkipped = 0;
 +void ps5_set_hold_pass(bool hold) {
 +  static uint64_t passes;
@@ -373,6 +980,7 @@ index 0f676e1..2efaccf 100644
 +
  void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
            uint32_t indexAddr, uint32_t baseVertex, uint32_t instances) {
++  const uint32_t dirtyGroups = gx2::take_dirty_groups();  // register groups changed since the previous draw
    if (!count || !instances || ((prim == 0x13 || prim == 0x14) && count < 4))
      return;
    if (r[REGADDR::PA_CL_CLIP_CNTL] & (1 << 22))
@@ -384,43 +992,186 @@ index 0f676e1..2efaccf 100644
 +  }
 +#endif
    ((uint32_t *)r)[REGADDR::VGT_PRIMITIVE_TYPE] = prim;
-   uint64_t fsKey = 0;
-   auto *fs = vk::get_fetch_shader(r, &fsKey, R.frame);
-@@ -2017,6 +2142,33 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
-                        ? depth_target(r, &depthSlice)
-                        : nullptr;
-   if (depth && depth->width == 1280 && depth->height == 720) R.mainDepthAddr = depth->addr;
-+#ifdef __PROSPERO__
-+  if (!ps5HoldPass && depth && !mask && r[gx2::kDepthSlicesReg] > 1) ps5ShadowDepth = depth->addr;  // the shadow maps (above)
-+#endif
-+#ifdef __PROSPERO__
-+  {
-+    // debug (WWHD_PS5_DRAW_TARGETS=1): how a frame's draws divide between its render targets
-+    static const bool on = [] { const char* e = std::getenv("WWHD_PS5_DRAW_TARGETS"); return e && *e && std::strcmp(e, "0") != 0; }();
-+    if (on) {
-+      struct Key { uint32_t color, depth, w, h, slice; bool operator<(const Key& o) const { return std::tie(color, depth, w, h, slice) < std::tie(o.color, o.depth, o.w, o.h, o.slice); } };
-+      static std::map<Key, uint32_t> counts;
-+      static uint64_t since = R.frame;
-+      const Surface* any = colors[0] ? colors[0] : depth;
-+      ++counts[{colors[0] ? colors[0]->addr : 0, depth ? depth->addr : 0, any ? any->width : 0, any ? any->height : 0, colors[0] ? slices[0] : depthSlice}];
-+      if (R.frame - since >= 600) {
-+        const double frames = double(R.frame - since);
-+        std::vector<std::pair<uint32_t, Key>> order;
-+        for (auto& [k, n] : counts) order.push_back({n, k});
-+        std::sort(order.begin(), order.end(), [](auto& x, auto& y) { return x.first > y.first; });
-+        for (size_t i = 0; i < order.size() && i < 14; i++)
-+          LOG("[targets] %7.1f draws/frame: colour %08X depth %08X %ux%u slice %u", order[i].first / frames, order[i].second.color,
-+              order[i].second.depth, order[i].second.w, order[i].second.h, order[i].second.slice);
-+        counts.clear();
-+        since = R.frame;
++  // continued-draw fast path (see fastpath_config); the AO replay draw stays outside of it
++  const auto& fastPath = fastpath_config();
++  const bool fastPathDraw = fastPath.on && !aoPrivateReplay;
++  bool fast = false;
++  if (fastPathDraw) {
++    report_continued_stats();
++    ContinuedReason reason = continued_reason(prim);
++    if (reason == kContinued) {
++      // guest writes to the reused textures (write tracking, GX2Invalidate) upload here; an upload
++      // can change lookups, so it ends the continuation
++      for (const auto& stage : continued.stages)
++        for (uint32_t i = 0; i < stage.count; ++i) upload_surface(stage.textures[i].surface);
++      if (g_surface_epoch != continued.surfaceEpoch) reason = kUpload;
++    }
++    if (reason == kContinued && fastPath.verifyEvery) {
++      static uint64_t verifyCounter = 0;
++      if (++verifyCounter % fastPath.verifyEvery == 0) {
++        ++continuedStats.verified;
++        ++continuedStats.totalVerified;
++        if (!verify_continued(r, prim)) reason = kVerifyMismatch;
 +      }
 +    }
++    fast = reason == kContinued;
++    ++continuedStats.draws;
++    ++continuedStats.reasons[reason];
++    if (reason == kRegisters)
++      for (int g = 0; g < gx2::kSgCount; ++g)
++        if ((dirtyGroups & ~gx2::kSgContinuedMask) >> g & 1) ++continuedStats.groups[g];
++    // a full draw records a new state below; exceptions leave none
++    continued.valid = false;
++    continued.invalidReason = kNoState;
 +  }
+   uint64_t fsKey = 0;
+-  auto *fs = vk::get_fetch_shader(r, &fsKey, R.frame);
+-  if (!fs)
+-    exception_report::raise("missing Vulkan fetch shader");
+-  auto *vs = vk::translate(r, true, fs, fsKey, R.frame, g_shader_state_gen);
+-  auto *ps = vk::translate(r, false, fs, fsKey, R.frame, g_shader_state_gen,
+-                           vs && vs->ready() ? vs : nullptr);
++  LatteFetchShader* fs;
++  vk::Shader *vs, *ps;
++  if (fast) {
++    fs = continued.fs;
++    fsKey = continued.fsKey;
++    vs = continued.vs;
++    ps = continued.ps;
++  } else {
++    fs = vk::get_fetch_shader(r, &fsKey, R.frame);
++    if (!fs)
++      exception_report::raise("missing Vulkan fetch shader");
++    vs = vk::translate(r, true, fs, fsKey, R.frame, g_shader_state_gen);
++    ps = vk::translate(r, false, fs, fsKey, R.frame, g_shader_state_gen,
++                       vs && vs->ready() ? vs : nullptr);
++  }
+   rprof::mark(rprof::kShader);
+   if (!vs || !vs->ready() || !ps || !ps->ready())
+     exception_report::raise("Vulkan shader translation failed: " +
+@@ -2189,52 +2699,17 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+     }
+   }
+   rprof::mark(rprof::kIndices);
+-  const auto &lcr = *reinterpret_cast<const LatteContextRegister *>(r);
+-  std::array<Surface *, 8> colors{};
+-  uint32_t slices[8]{}, depthSlice = 0;
+-  auto mask = LatteMRT::GetActiveColorBufferMask(ps->dec, lcr);
+-  for (int i = 0; i < 8; i++)
+-    if (mask & (1 << i))
+-      colors[i] = color_target(r, i, &slices[i]);
+-  Surface *depth = LatteMRT::GetActiveDepthBufferMask(lcr)
+-                       ? depth_target(r, &depthSlice)
+-                       : nullptr;
+-  if (depth && depth->width == 1280 && depth->height == 720) R.mainDepthAddr = depth->addr;
+-  const uint32_t guestWidth = colors[0] ? colors[0]->width : 0;
+-  const uint32_t guestHeight = colors[0] ? colors[0]->height : 0;
+-  if (aoPrivateReplay && colors[0]) {
+-    aoPrivateSource = colors[0]->addr;
+-    colors[0] = private_ao_surface(aoPrivateColor, colors[0]);
+-    slices[0] = 0;
+-    if (depth) {
+-      depth = private_ao_surface(aoPrivateDepth, depth);
+-      depthSlice = 0;
+-    }
+-  }
+-  Surface *target = depth;
+-  for (auto *c : colors)
+-    if (c) {
+-      target = c;
+-      break;
+-    }
+-  if (!target)
++  DrawTargets targets;
++  if (fast) targets = continued.targets;
++  else if (!resolve_targets(r, ps, targets))
+     return;
+-  uint32_t width = target->extent.width, height = target->extent.height;
+-  float sx = target->sx, sy = target->sy;
+-  if (aoPrivateReplay && guestWidth) {
+-    // the viewport registers describe the game's smaller buffer (x and y differ at other aspect ratios)
+-    sx = float(colors[0]->extent.width) / guestWidth;
+-    sy = guestHeight ? float(colors[0]->extent.height) / guestHeight : sx;
+-  }
+-  for (auto *&c : colors)
+-    if (c && (c->extent.width != width || c->extent.height != height)) {
+-      if (aoPrivateReplay) c = nullptr;
+-      else exception_report::raise("mismatched Vulkan attachments");
+-    }
+-  if (depth && (depth->extent.width < width || depth->extent.height < height))
+-    depth = nullptr;
++  auto& colors = targets.colors;
++  auto& slices = targets.slices;
++  Surface* depth = targets.depth;
++  const uint32_t depthSlice = targets.depthSlice, width = targets.width, height = targets.height;
++  const float sx = targets.sx, sy = targets.sy;
+   rprof::mark(rprof::kTargets);
+-  auto &p = pipeline(r, vs, ps, fs, topology, colors, depth);
++  auto &p = fast ? *continued.pipeline : pipeline(r, vs, ps, fs, topology, colors, depth);
+   rprof::mark(rprof::kPipeline);
+   if (!p.pipeline && !p.pendingCompile) return;
+   if (p.pendingCompile && !begin_exact_preparation()) resolve_pending_pipeline(p);
+@@ -2243,8 +2718,35 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+   if(vertex_window_stats_enabled()) report_vertex_window_stats();
+   FeedbackStatsProbe feedbackProbe;
+   auto* probe=feedback_stats_enabled()?&feedbackProbe:nullptr;
+-  auto vres = bind_stage(r, vs, p.sets[0], p.dynamicUniforms, sx, sy, colors, depth, probe);
+-  auto pres = bind_stage(r, ps, p.sets[1], p.dynamicUniforms, sx, sy, colors, depth, probe);
++  const bool recordState = fastPathDraw && !fast;
++  if (recordState)
++    for (auto& stage : continued.stages) stage = {};
++  auto vres = bind_stage(r, vs, p.sets[0], p.dynamicUniforms, sx, sy, colors, depth, probe,
++                         fast ? &continued.stages[0] : nullptr, recordState ? &continued.stages[0] : nullptr);
++  auto pres = bind_stage(r, ps, p.sets[1], p.dynamicUniforms, sx, sy, colors, depth, probe,
++                         fast ? &continued.stages[1] : nullptr, recordState ? &continued.stages[1] : nullptr);
++  if (fastPathDraw) {
++    // the resolved state of this draw: continued by the next draws while nothing breaking changes
++    auto& c = continued;
++    c.valid = fast || (c.stages[0].continuable && c.stages[1].continuable);
++    c.invalidReason = kNotContinuable;
++    if (!fast) {
++      c.stateVersion = gx2::g_full_state_version;
++      c.surfaceEpoch = g_surface_epoch;
++      c.frame = R.frame;
++      c.prim = prim;
++      c.topology = topology;
++      c.aoMode = ao_mode();
++      c.aoHires = ao_hires_enabled();
++      c.aniso = aniso_enabled();
++      c.fs = fs;
++      c.fsKey = fsKey;
++      c.vs = vs;
++      c.ps = ps;
++      c.targets = targets;
++      c.pipeline = &p;
++    }
++  }
+   // Texture uploads, feedback copies, and sampling transitions above may have
+   // ended the previous pass. Reuse only its exact active attachment set.
+   bool reusePass = R.rendering && R.passTracked && R.passColors == colors &&
+@@ -2328,7 +2830,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+     ri.pColorAttachments = attachments.data();
+     ri.pDepthAttachment = depth ? &da : nullptr;
+     ri.pStencilAttachment = depth && depth->fmt.stencil ? &da : nullptr;
+-    if(R.gpuPassTimestampsEnabled) gpu_begin_render_scope(colors,depth,slices,depthSlice,width,height);
++    if(R.gpuPassTimestampsEnabled) gpu_begin_render_scope(colors,depth,slices.data(),depthSlice,width,height);
+     trace_pass(colors, ncolor, depth, depthSlice, width, height);
+     record::vkCmdBeginRendering(cmd, &ri);
+     ++R.renderPassCount;
+@@ -2474,6 +2976,12 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+     } else {
+       const size_t bytes = size_t(count) * indexBytes;
+       const auto* guest = static_cast<const uint8_t*>(mem::ptr(indexAddr));
++#ifdef __PROSPERO__
++      if (ps5_copy_async_enabled()) {
++        nativeIndexSlice = snapshot_guest(guest, bytes, 4);
++        nativeIndexData = guest;
++      } else
 +#endif
-   const uint32_t guestWidth = colors[0] ? colors[0]->width : 0;
-   const uint32_t guestHeight = colors[0] ? colors[0]->height : 0;
-   if (aoPrivateReplay && colors[0]) {
-@@ -2355,12 +2507,24 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+       if (R.uploadReadsDirect) {
+         nativeIndexSlice = snapshot(guest, bytes, 4);
+         nativeIndexData = nativeIndexSlice.mapped;
+@@ -2556,12 +3064,24 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
          attributeEnd && stride && extent.valid && vertexExtent.valid &&
          windowEnd<=copied && windowBegin<windowEnd && windowBegin!=0;
      UploadSlice b;
@@ -446,14 +1197,36 @@ index 0f676e1..2efaccf 100644
      VkDeviceSize offset = b.offset;
      static const bool skipVertexBinds = [] {
        const char* e=std::getenv("WWHD_VK_SKIP_VERTEX_BINDS");
+@@ -2604,8 +3124,8 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+   }
+   if(R.gpuPassTimestampsEnabled) gpu_count_render_draw();
+   for (auto *color : colors)
+-    if (color) mark_gpu_written(color);
+-  if (depth) mark_gpu_written(depth);
++    if (color) mark_draw_target_written(color);
++  if (depth) mark_draw_target_written(depth);
+   R.drawCount++;
+   if (aoPrivateReplay) {
+     aoPrivateFrame = R.frame;
+@@ -2618,6 +3138,9 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+       ~ReplayGuard() { aoPrivateReplay = false; }
+     } guard;
+     draw(r, prim, count, indexType, indexAddr, baseVertex, instances);
++    // the replay changes later lookups (aoPrivateSource/aoPrivateFrame, private images)
++    continued.valid = false;
++    continued.invalidReason = kAoReplay;
+   }
+   static const uint32_t drawBatch = parse_draw_batch(std::getenv("WWHD_VK_DRAW_BATCH"));
+   static const uint32_t drawBatchCap =
 diff --git a/runtime/src/gfx/vulkan/overlay_sdl.cpp b/runtime/src/gfx/vulkan/overlay_sdl.cpp
-index 58d5039..42c5d84 100644
+index b192f82..67e6de0 100644
 --- a/runtime/src/gfx/vulkan/overlay_sdl.cpp
 +++ b/runtime/src/gfx/vulkan/overlay_sdl.cpp
-@@ -207,6 +207,15 @@ void load_saved_options() {
-     }
-     auto saved = [&](const char* key, std::initializer_list<const char*> env) { return !env_set(env) && v.count(key); };
-     auto num = [&](const char* key) { return atof(v[key].c_str()); };
+@@ -211,6 +211,15 @@ void load_saved_options() {
+ #ifdef __ANDROID__
+     if (saved("touchButtons", {})) gfx::g_touch_buttons = std::clamp((int)num("touchButtons"), 0, 2);
+     if (saved("touchControls", {})) gfx::g_touch_controls = num("touchControls") != 0;
++#endif
 +#ifdef __PROSPERO__
 +    // PlayStation 5, first start (nothing saved yet): three times the internal resolution, and
 +    // 60 fps (frame interpolation) keeping the game's speed (interp.cpp: on by default here). Where
@@ -462,15 +1235,39 @@ index 58d5039..42c5d84 100644
 +    // in-between frames are left out: 30 frames a second, the game at full speed.
 +    if (!v.count("resScale") && !env_set({"WWHD_RES_SCALE"})) gfxvk::set_res_scale(3.0f);
 +    if (!v.count("fps60") && !env_set({"WWHD_INTERP", "WWHD_TRUE60", "WWHD_INTERP_FPS"})) interp::set_mode(1);
-+#endif
+ #endif
      if (saved("resScale", {"WWHD_RES_SCALE"})) gfxvk::set_res_scale((float)num("resScale"));
      if (saved("aoMode", {"WWHD_AO_MODE", "WWHD_NO_AO_QUIRK"})) gfxvk::set_ao_mode((int)num("aoMode"));
-     if (saved("aoHires", {"WWHD_AO_HIRES"})) gfxvk::set_ao_hires(num("aoHires") != 0);
 diff --git a/runtime/src/gfx/vulkan/surfaces.cpp b/runtime/src/gfx/vulkan/surfaces.cpp
-index 79dcd53..91f3e18 100644
+index 4ec5cfd..c198233 100644
 --- a/runtime/src/gfx/vulkan/surfaces.cpp
 +++ b/runtime/src/gfx/vulkan/surfaces.cpp
-@@ -1107,6 +1107,15 @@ static uint32_t mip_base(Surface* s,uint32_t level) {
+@@ -280,6 +280,7 @@ Surface* surface_from_depth_buffer(uint32_t addr, uint32_t* firstSlice, uint32_t
+ // ---------------------------------------------------------------- sampled textures
+ static uint64_t sparse_hash(Surface* s);
+ uint64_t g_stat_full_checks, g_stat_uploads, g_stat_invalidates, g_stat_invalidated_surfaces;
++uint64_t g_surface_epoch = 1;  // backend.h
+ 
+ // Based on GreenNaugahyde/ZeldaWWHDRecompAndroid, commit 73b54e1 (rendered mip chains).
+ static Surface* with_mip_chain(Surface* s, const SurfaceDesc& d) {
+@@ -670,6 +671,7 @@ void destroy_surface_image(Surface* s) {
+     if (!s) return;
+     if (s->mipChain) { destroy_surface_image(s->mipChain.get()); s->mipChain.reset(); }
+     if(!s->image)return;
++    ++g_surface_epoch;
+     auto views=std::move(s->layerViews);if(s->view)views.push_back(s->view);
+     for(auto& [key,view]:s->sampledViews)if(view)views.push_back(view);s->sampledViews.clear();
+     defer_surface_image(s->image,s->memory,std::move(views));
+@@ -1091,7 +1093,7 @@ Surface* find_or_create_surface(const SurfaceDesc& d,bool forRendering) {
+     s->format=d.format;s->dim=d.dim;s->tileMode=d.tileMode;s->swizzle=d.swizzle;s->isDepth=d.isDepth;
+     s->fmt=d.isDepth&&!forRendering?comparison_format_info(d.format):format_info(d.format,d.isDepth);
+     create_surface_image(s.get(),forRendering);
+-    auto* raw=s.get();R.surfaces.emplace(d.addr,std::move(s));
++    auto* raw=s.get();R.surfaces.emplace(d.addr,std::move(s));++g_surface_epoch;
+     // format views of one guest surface (adopt_newer_alias): flag them once, so lookups stay cheap
+     if(!raw->isDepth&&!raw->fmt.compressed&&raw->fmt.convert==Convert::NONE) {
+         auto views=R.surfaces.equal_range(d.addr);
+@@ -1117,6 +1119,15 @@ static uint32_t mip_base(Surface* s,uint32_t level) {
      cached.address=address;cached.addressValid=true;
      return cached.address;
  }
@@ -486,7 +1283,7 @@ index 79dcd53..91f3e18 100644
  void upload_surface(Surface* s) {
      if(!s||!s->image||s->gpuWritten)return;
      // All callers, including render attachments, share the once-per-frame
-@@ -1150,6 +1159,9 @@ void upload_surface(Surface* s) {
+@@ -1160,6 +1171,9 @@ void upload_surface(Surface* s) {
      end_encoder();transition_image(s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
      for(uint32_t level=0;level<s->mips;++level) {
          std::vector<uint8_t> data;uint32_t w,h,slices;decode_level(s,level,mip_base(s,level),data,w,h,slices);
@@ -496,7 +1293,16 @@ index 79dcd53..91f3e18 100644
          if (s->bcDecoded) { bc_decode_upload(s,level,data,w,h,slices); continue; }
          std::vector<VkBufferImageCopy> copies;std::vector<uint8_t> packed;
          bool threeD=s->imageType==VK_IMAGE_TYPE_3D;
-@@ -1206,6 +1218,9 @@ void clear_color(const uint32_t*,uint32_t cb,const float rgba[4]) {
+@@ -1183,7 +1197,7 @@ void upload_surface(Surface* s) {
+         defer_buffer(staging);
+     }
+     transition_image(s,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+-    s->contentHash=hash;s->writeSeq=next_write_seq();s->dirty=false;++g_stat_uploads;
++    s->contentHash=hash;s->writeSeq=next_write_seq();s->dirty=false;++g_stat_uploads;++g_surface_epoch;
+ }
+ void clear_color(const uint32_t*,uint32_t cb,const float rgba[4]) {
+     uint32_t first,num;auto* s=surface_from_color_buffer(cb,&first,&num);if(!s)return;
+@@ -1216,6 +1230,9 @@ void clear_color(const uint32_t*,uint32_t cb,const float rgba[4]) {
  }
  void clear_depth_stencil(const uint32_t*,uint32_t db,float depth,uint32_t stencil,uint32_t flags) {
      uint32_t first,num;auto* s=surface_from_depth_buffer(db,&first,&num);if(!s)return;
@@ -506,7 +1312,13 @@ index 79dcd53..91f3e18 100644
      VkImageAspectFlags aspects=0;if(flags&1)aspects|=VK_IMAGE_ASPECT_DEPTH_BIT;if((flags&2)&&s->fmt.stencil)aspects|=VK_IMAGE_ASPECT_STENCIL_BIT;
      if(!aspects)return;
      end_encoder();transition_image(s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
-@@ -1383,6 +1398,9 @@ void copy_surface(uint32_t src,uint32_t srcMip,uint32_t srcSlice,uint32_t dst,ui
+@@ -1388,11 +1405,15 @@ void copy_surface_impl(uint32_t srcAddr,uint32_t srcMip,uint32_t srcSlice,uint32
+         memcpy(mem::ptr(dbase+offset),rows.data()+(size_t(y)*bw+x)*sf.bytesPerBlock,sf.bytesPerBlock);
+     }
+     for(auto& [address,image]:R.surfaces)if(address==dbase){image->gpuWritten=false;image->dirty=true;image->lastCheckedFrame=~0ull;}
++    ++g_surface_epoch;
+ }
+ void copy_surface(uint32_t src,uint32_t srcMip,uint32_t srcSlice,uint32_t dst,uint32_t dstMip,uint32_t dstSlice) {
      copy_surface_impl(src,srcMip,srcSlice,dst,dstMip,dstSlice);
  }
  void invalidate(uint32_t flags,uint32_t addr,uint32_t size) {
@@ -516,14 +1328,139 @@ index 79dcd53..91f3e18 100644
      buffer_cache_guest_invalidate(flags,addr,size);
      ++g_stat_invalidates;if(!(flags&2)||size>=0x10000000)return;
      uint64_t end=uint64_t(addr)+size;
+@@ -1438,6 +1459,7 @@ void invalidate(uint32_t flags,uint32_t addr,uint32_t size) {
+ }
+ void ss_reset_surfaces() {
+     R.mainDepthAddr = 0;
++    ++g_surface_epoch;
+     reset_ao_private_cache();
+     for(auto& [addr,s]:R.surfaces){s->guestLayout.reset();s->dirty=true;s->lastCheckedFrame=~0ull;}
+ }
 diff --git a/runtime/src/gx2/gx2_core.cpp b/runtime/src/gx2/gx2_core.cpp
-index 1fd7427..f66cee0 100644
+index 8b4fc26..79de060 100644
 --- a/runtime/src/gx2/gx2_core.cpp
 +++ b/runtime/src/gx2/gx2_core.cpp
-@@ -482,6 +482,13 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
-         render::write_back();
-         break;
-     case OP_SWAP:
+@@ -1,3 +1,6 @@
++#ifdef __PROSPERO__
++extern "C" void ps5_copy_drain();
++#endif
+ #include "../game_clock.h"
+ #include "vsync_pacing.h"
+ #include "../mods/fast_forward.h"
+@@ -22,6 +25,7 @@
+ #include "gx2_regs.h"
+ #include "register_blocks.h"
+ #include "gx2_texture_regs.h"
++#include "state_groups.h"
+ #ifdef WWHD_HAS_VULKAN
+ #include "shader_key_dirty.h"
+ #include "gfx/vulkan/api.h"
+@@ -80,6 +84,23 @@ static bool shader_irrelevant(uint32 reg) {
+     return false;
+ }
+ static ShaderKeyDirtyStats shaderKeyDirtyStats;
++
++// register state groups (state_groups.h): the continued-draw fast path of the Vulkan renderer
++uint64_t g_full_state_version = 1;
++uint32_t g_dirty_groups = 0;
++static const struct StateGroupTable {
++    uint8_t group[kNumRegs];
++    StateGroupTable() { for (uint32 r = 0; r < kNumRegs; ++r) group[r] = state_group(r); }
++} g_state_groups;
++static inline void note_state_change(uint32 reg, uint32 old, uint32 value) {
++    const uint32 g = state_group_change(g_state_groups.group[reg], old, value);
++    g_dirty_groups |= 1u << g;
++    g_full_state_version += !((kSgContinuedMask >> g) & 1);
++}
++static inline void note_full_state_change() {
++    g_dirty_groups |= 1u << kSgOther;
++    ++g_full_state_version;
++}
+ ShaderKeyDirtyStats shader_key_dirty_stats() { return shaderKeyDirtyStats; }
+ 
+ #ifdef WWHD_HAS_VULKAN
+@@ -96,6 +117,7 @@ static void apply_small_regs(uint32 first, const uint32* v, uint32 n) {
+         const uint32 reg = first + i, value = v[i], old = g_regs[reg];
+         if (old != value) {
+             changed = true;
++            note_state_change(reg, old, value);
+             if (classify) {
+                 if (rprof::fast_class_reg(reg)) rprof::g_reg_dirty |= 1;
+                 else rprof::note_other_reg(reg);
+@@ -140,6 +162,8 @@ static void apply_regs(uint32 first, const uint32* v, uint32 n) {
+     }
+ #endif
+     if (memcmp(&g_regs[first], v, n * 4) != 0) {
++        for (uint32 i = 0; i < n; i++)
++            if (g_regs[first + i] != v[i]) note_state_change(first + i, g_regs[first + i], v[i]);
+         if (rprof::enabled())  // draw classifier (render_prof.h)
+             for (uint32 i = 0; i < n; i++)
+                 if (g_regs[first + i] != v[i]) {
+@@ -225,9 +249,52 @@ static void render_thread_main() {
+     }
+ }
+ 
++#ifdef __PROSPERO__
++// PlayStation 5: the game's thread hands its commands over in batches. On the first island it
++// issues about 46,000 a frame (40,000 of them register writes), and each took the queue's mutex and,
++// when the render thread was waiting, a system call to wake it: a few milliseconds of each frame on
++// the game's thread, and a wake-up per command on the render thread's. Now the issuing thread
++// keeps its commands until it has 4 KiB of them or issues one the render thread must act on at
++// once (a flush, DrawDone, a swap, a fence, a copy, an invalidation); a thread other than the
++// game's main thread hands over every command as before, so that nothing of a loader thread's waits
++// unseen. WWHD_PS5_BATCH_QUEUE=0 in /app0/env.txt restores one hand-over per command.
++static thread_local std::vector<uint32> t_staged;
++static std::atomic<pthread_t> g_batching_thread{0};
++static bool batch_queue() {
++    static const bool on = [] { const char* e = getenv("WWHD_PS5_BATCH_QUEUE"); return !e || strcmp(e, "0") != 0; }();
++    return on;
++}
++static void flush_staged() {
++    if (t_staged.empty()) return;
++    std::lock_guard<std::mutex> lk(g_q_mutex);
++    g_q_pending.insert(g_q_pending.end(), t_staged.begin(), t_staged.end());
++    t_staged.clear();
++    if (g_q_waiting) g_q_cv.notify_one();
++}
++#endif
+ static void enqueue(Op op, const uint32* payload, uint32 n) {
+     static std::once_flag once;
+     std::call_once(once, [] { std::thread([] { exception_report::boundary("GX2 render thread", render_thread_main); }).detach(); });
++#ifdef __PROSPERO__
++    if (batch_queue()) {
++        pthread_t expected = 0;
++        const pthread_t self = pthread_self();
++        if (g_batching_thread.load(std::memory_order_relaxed) == self ||
++            g_batching_thread.compare_exchange_strong(expected, self)) {  // the first thread to issue: the game's main thread
++            t_staged.push_back(op | (n << 8));
++            t_staged.insert(t_staged.end(), payload, payload + n);
++            switch (op) {
++            case OP_FLUSH: case OP_DRAW_DONE: case OP_SWAP: case OP_FENCE: case OP_COPY_SURFACE:
++            case OP_COPY_TO_SCAN: case OP_PEEK_Z: case OP_INVALIDATE: case OP_SETUP_CONTEXT:
++                flush_staged();
++                break;
++            default:
++                if (t_staged.size() >= 1024) flush_staged();
++            }
++            return;
++        }
++    }
++#endif
+     std::lock_guard<std::mutex> lk(g_q_mutex);
+     g_q_pending.push_back(op | (n << 8));
+     g_q_pending.insert(g_q_pending.end(), payload, payload + n);
+@@ -379,6 +446,7 @@ static void set_context(uint32 ctx) {
+ #endif
+         return true;
+     })) ++g_shader_state_gen;
++    note_full_state_change();
+     rprof::g_reg_dirty |= 2;  // draw classifier: a context load counts as a full state change
+ }
+ 
+@@ -498,6 +566,13 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
+     case OP_SWAP: {
+         static const bool load = getenv("WWHD_TEST_RENDER_LOAD_MS") != nullptr;
+         if (load) test_frame_load("WWHD_TEST_RENDER_LOAD_MS");
 +#ifdef __PROSPERO__
 +        // PlayStation 5: the game records a frame's drawing during one pass and plays it back at the
 +        // start of the next, after the swap that ends that next pass's predecessor: what follows a
@@ -534,7 +1471,17 @@ index 1fd7427..f66cee0 100644
          if (n) render::set_frame_aspect(gx2::bitsf(p[0]));  // aspect ratio from the next frame on (aspect.cpp)
          if (n >= 3 && p[2]) render::request_capture();
          render::swap();
-@@ -821,6 +828,7 @@ HLE(gx2, GX2SwapScanBuffers) {
+@@ -528,6 +603,9 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
+         g_shadow = g_contexts[p[0]].data();
+         break;
+     case OP_FENCE: {
++#ifdef __PROSPERO__
++        ps5_copy_drain();  // the game may write what the draws before this point read (ps5/src/copier_ps5.cpp)
++#endif
+         std::lock_guard<std::mutex> lk(g_q_mutex);
+         g_fence_done = std::max<uint64_t>(g_fence_done, p[0]);
+         g_q_done_cv.notify_all();
+@@ -958,6 +1036,7 @@ HLE(gx2, GX2SwapScanBuffers) {
      }
      if (capture) emit_host(OP_SWAP, {ab, hold ? 1u : 0u, 1u});
      else emit_host(OP_SWAP, {ab, hold ? 1u : 0u});
@@ -542,6 +1489,14 @@ index 1fd7427..f66cee0 100644
      {
          std::lock_guard<std::mutex> lk(g_flip_mutex);
          update_flips();
+@@ -1166,6 +1245,7 @@ void gx2_ss_load(ss::Reader& r) {
+     auto it = g_contexts.find(active);
+     g_shadow = active && it != g_contexts.end() ? it->second.data() : nullptr;
+     g_shader_state_gen++;
++    note_full_state_change();
+     g_swap_interval = std::max<uint32>(r.u32(), 1);
+     uint64_t guest_swaps = r.u64();
+     {
 diff --git a/runtime/src/hle/swkbd.cpp b/runtime/src/hle/swkbd.cpp
 index 1b20355..1c372a9 100644
 --- a/runtime/src/hle/swkbd.cpp
@@ -572,10 +1527,10 @@ index 1b20355..1c372a9 100644
      r.initial = S.text;
      r.hint = S.hint;
 diff --git a/runtime/src/input_map.cpp b/runtime/src/input_map.cpp
-index a12f7db..65754ed 100644
+index 0d43506..e4fa424 100644
 --- a/runtime/src/input_map.cpp
 +++ b/runtime/src/input_map.cpp
-@@ -183,6 +183,13 @@ Mapping Mapping::defaults() {
+@@ -187,6 +187,13 @@ Mapping Mapping::defaults() {
          kPadNone,  // Screenshot: no controller input by default (every button already plays)
      };
      for (int a = 0; a < kActionCount; a++) m.pad[a] = pads[a];
@@ -590,22 +1545,22 @@ index a12f7db..65754ed 100644
      return m;
  }
 diff --git a/runtime/src/interp.cpp b/runtime/src/interp.cpp
-index ce9aed0..3aa77d7 100644
+index 2adf4a9..58b7138 100644
 --- a/runtime/src/interp.cpp
 +++ b/runtime/src/interp.cpp
-@@ -669,7 +669,7 @@ void ss_reset() {
- // values.
- static const char* const g_env_paced = getenv("WWHD_INTERP_PACED");
+@@ -675,7 +675,7 @@ static const char* const g_env_paced = getenv("WWHD_INTERP_PACED");
+ // allows: unpaced, the Outset save-state benchmark ran 16 logic steps a second (half speed, and the
+ // audio, which follows the game's speed, crackled)
  static std::atomic<bool> g_paced{[] {
--#ifdef __ANDROID__
-+#if defined(__ANDROID__) || defined(__PROSPERO__)  // (PlayStation 5: the open sea does not fit two passes a step)
+-#if defined(__ANDROID__) || (defined(_WIN32) && (defined(_M_ARM64) || defined(__aarch64__)))
++#if defined(__ANDROID__) || defined(__PROSPERO__) || (defined(_WIN32) && (defined(_M_ARM64) || defined(__aarch64__)))  // (PlayStation 5: the open sea does not fit two passes a step)
      return !g_env_paced || atoi(g_env_paced) != 0;
  #else
      return g_env_paced && atoi(g_env_paced) != 0;
-@@ -711,6 +711,37 @@ constexpr auto kPacedStep = std::chrono::nanoseconds(33'333'333);
- // a logic pass and an in-between pass both wait for the 59.94 Hz grid (2 x 16.68 = 33.37 ms, more
- // than kPacedStep): 2 ms of slack
- constexpr auto kPacedBudget = std::chrono::nanoseconds(kPacedStep + std::chrono::milliseconds(2));
+@@ -730,6 +730,55 @@ static void trace_step(pace_clock::time_point now, pace_clock::time_point before
+     fprintf(out, "%.3f %.3f %.3f %c %.3f %.3f\n", ms(now), ms(before), ms(g_last_logic), how, std::chrono::duration<double, std::milli>(g_logic_avg).count(),
+             std::chrono::duration<double, std::milli>(g_hold_avg).count());
+ }
 +#ifdef __PROSPERO__
 +// PlayStation 5: whether an in-between pass fits is read from what it did to its step, not from its
 +// own duration. The pass is timed on the game's thread, and measured one tick of the display where
@@ -617,13 +1572,31 @@ index ce9aed0..3aa77d7 100644
 +// time); a probe tries one again. A probe that is late costs its step a tick, so the wait before
 +// the next doubles, from one second to four, and goes back to one second after thirty steps in a
 +// row that were on time.
++// how late a step may be before it counts: WWHD_PS5_LATE_MS (default 2; it was 6, which let a pass
++// just over a tick run the game at 93 to 97% speed with every in-between frame drawn)
++static pace_clock::duration ps5_late_allowance() {
++    static const pace_clock::duration d = [] {
++        const char* e = getenv("WWHD_PS5_LATE_MS");
++        return std::chrono::duration_cast<pace_clock::duration>(std::chrono::duration<double, std::milli>(e ? atof(e) : 2.0));
++    }();
++    return d;
++}
++// the longest wait between probes while the in-between frames are off: WWHD_PS5_PROBE_S (default 1;
++// it was 4, and a 30 fps spell then outlived the heavy view by seconds: Gary chose the short wait)
++static pace_clock::duration ps5_probe_wait_max() {
++    static const pace_clock::duration d = [] {
++        const char* e = getenv("WWHD_PS5_PROBE_S");
++        return std::chrono::duration_cast<pace_clock::duration>(std::chrono::duration<double>(e ? atof(e) : 1.0));
++    }();
++    return d;
++}
 +static bool g_ps5_late[4];
 +static int g_ps5_late_at = 0, g_ps5_on_time_run = 0;
 +static pace_clock::duration g_ps5_probe_after = std::chrono::seconds(1);
 +static void ps5_hold_sample(bool late, bool probe) {
 +    if (probe) {
 +        for (bool& l : g_ps5_late) l = late;
-+        if (late) g_ps5_probe_after = std::min<pace_clock::duration>(g_ps5_probe_after * 2, std::chrono::seconds(4));
++        if (late) g_ps5_probe_after = std::min<pace_clock::duration>(g_ps5_probe_after * 2, ps5_probe_wait_max());
 +    } else {
 +        g_ps5_late[g_ps5_late_at++ & 3] = late;
 +    }
@@ -640,26 +1613,26 @@ index ce9aed0..3aa77d7 100644
  // start of every pass: the last pass's own duration, and the wait before a logic pass that follows
  // a dropped in-between pass (and at 120/240 fps before every logic pass that comes early)
  static void paced_pass_start() {
-@@ -726,6 +757,11 @@ static void paced_pass_start() {
-         pace_clock::duration& avg = g_pass_was_hold ? g_hold_avg : g_logic_avg;
-         // a probe after a long pause replaces the old value: the scene may have changed since
-         avg = g_pass_was_hold && g_probe ? pass : pace_clock::duration(pacing::update_average(avg.count(), pass.count()));
+@@ -756,6 +805,11 @@ static void paced_pass_start() {
+         } else {
+             avg = pace_clock::duration(pacing::update_average(avg.count(), pass.count()));
+         }
 +#ifdef __PROSPERO__
 +        // (60 fps: a step is its logic pass and one in-between pass, and this logic pass follows it)
 +        if (g_pass_was_hold && !g_hold_next && g_last_logic != pace_clock::time_point{})
-+            ps5_hold_sample(now - g_last_logic > kPacedStep + std::chrono::milliseconds(6), g_probe);
++            ps5_hold_sample(now - g_last_logic > kPacedStep + ps5_late_allowance(), g_probe);
 +#endif
          if (g_pass_was_hold) g_probe = false;
      }
      g_pass_was_hold = g_hold_next;
-@@ -798,8 +834,18 @@ static void after_pass(int phase) {
+@@ -868,8 +922,18 @@ static void after_pass(int phase) {
      const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now - g_last_logic).count();
      // After a long time without in-between passes their cost is stale (the scene may be lighter
      // now): one probe, if one vsync tick fits; its duration replaces the estimate.
 +#ifdef __PROSPERO__
-+    const bool probe = phase == 0 && now - g_last_hold >= g_ps5_probe_after;
++    const bool probe = phase == 0 && (now - g_last_hold >= g_ps5_probe_after || (g_probe_retry != pace_clock::time_point{} && now >= g_probe_retry));
 +#else
-     const bool probe = phase == 0 && now - g_last_hold >= kProbeAfter;
+     const bool probe = phase == 0 && (now - g_last_hold >= kProbeAfter || (g_probe_retry != pace_clock::time_point{} && now >= g_probe_retry));
 +#endif
 +#ifdef __PROSPERO__
 +    // PlayStation 5: one tick, or two after a step that an in-between pass made late (ps5_hold_estimate)
@@ -671,7 +1644,7 @@ index ce9aed0..3aa77d7 100644
      switch (pacing::next_pass(phase, g_step_n, elapsed, pass, kPacedBudget.count())) {
      case pacing::Next::kHold:
          g_hold_next = true;
-@@ -951,6 +997,7 @@ extern "C" void hook_0203593C(Cpu* c) {
+@@ -1024,6 +1088,7 @@ extern "C" void hook_0203593C(Cpu* c) {
          if (true60::enabled()) g_step_n = 1;  // (switched to true 60 within a step)
          g_hold = true;
          g_hold_frame = true;
@@ -680,10 +1653,10 @@ index ce9aed0..3aa77d7 100644
          if (record_pass()) {
              g_record_passes++;
 diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
-index 0deb727..9008334 100644
+index 18816c4..06c8cea 100644
 --- a/runtime/src/main.cpp
 +++ b/runtime/src/main.cpp
-@@ -83,11 +83,11 @@ static void crash_handler(int sig, siginfo_t* si, void* uctx) {
+@@ -90,11 +90,11 @@ static void crash_handler(int sig, siginfo_t* si, void* uctx) {
      uintptr_t base = (uintptr_t)PPC_MEM_BASE;
      char path[96];
      {
@@ -697,7 +1670,7 @@ index 0deb727..9008334 100644
          g_crash_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
      }
      const int fd = g_crash_fd;
-@@ -181,9 +181,9 @@ static void win_crash_out(int fd, const char* s, size_t n) { crash_context::reda
+@@ -188,9 +188,9 @@ static void win_crash_out(int fd, const char* s, size_t n) { crash_context::reda
  static void win_crash_log_only(int fd, const char* s, size_t n) { crash_context::redact(fd, {s,n}, win_crash_log_raw); }
  static LONG WINAPI crash_handler(EXCEPTION_POINTERS* ex) {
      auto code=ex->ExceptionRecord->ExceptionCode;
@@ -709,7 +1682,7 @@ index 0deb727..9008334 100644
      int fd=_open(path,_O_WRONLY|_O_CREAT|_O_TRUNC|_O_BINARY,_S_IREAD|_S_IWRITE);
      char buf[256]; int n;
      // the module holding the faulting instruction (issue #41: a driver or an overlay's Vulkan layer)
-@@ -329,12 +329,12 @@ static void start_log_file(bool error = false) {
+@@ -335,12 +335,12 @@ static void start_log_file(bool error = false) {
      const char* overlay_trace = getenv("WWHD_OVERLAY_TRACE");
      const bool tracing_overlay = overlay_trace && !strcmp(overlay_trace,"1");
      if (!(e && *e) && !tracing_overlay && !(hostui::get("logFile", saved) && saved == "1")) return;
@@ -726,7 +1699,7 @@ index 0deb727..9008334 100644
      }
  #ifdef _WIN32
      g_log_fd = _open(path.c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
-@@ -348,6 +348,9 @@ static void start_log_file(bool error = false) {
+@@ -354,6 +354,9 @@ static void start_log_file(bool error = false) {
  }
  
  extern "C" void synthetic_game_frame(Cpu*, PpcFunc);
@@ -735,8 +1708,8 @@ index 0deb727..9008334 100644
 +#endif
  
  int main(int argc, char** argv) {
-     mods::code::startup(argc, argv);
-@@ -386,10 +389,20 @@ int main(int argc, char** argv) {
+     std::string shader_prebuild_root;
+@@ -410,10 +413,20 @@ int main(int argc, char** argv) {
              fclose(f);
          }
      }
@@ -757,7 +1730,7 @@ index 0deb727..9008334 100644
  #ifdef __ANDROID__
      bool display_smoke = false;
  #endif
-@@ -528,6 +541,9 @@ int main(int argc, char** argv) {
+@@ -589,6 +602,9 @@ int main(int argc, char** argv) {
      std::thread([] {
          threads::run_main(mod, 1, args);
          LOG("[boot] game main thread returned");
@@ -768,7 +1741,7 @@ index 0deb727..9008334 100644
      }).detach();
      render::run_main_loop();
 diff --git a/runtime/src/platform/host.h b/runtime/src/platform/host.h
-index 7787a3f..42a39cd 100644
+index cad6c1e..d956dd2 100644
 --- a/runtime/src/platform/host.h
 +++ b/runtime/src/platform/host.h
 @@ -28,6 +28,11 @@
@@ -781,12 +1754,12 @@ index 7787a3f..42a39cd 100644
 +extern "C" void ps5_thread_place(const char* name);
 +#endif
  namespace host {
- #if defined(__APPLE__) && defined(WWHD_HAS_VULKAN)
- // Render command batches can create Objective-C temporaries inside MoltenVK.
-@@ -54,6 +59,13 @@ inline void set_thread_name(const char* name) {
-  using SetDescription=HRESULT(WINAPI*)(HANDLE,PCWSTR);
-  auto f=(SetDescription)GetProcAddress(GetModuleHandleW(L"Kernel32.dll"),"SetThreadDescription");
-  if(f) { std::wstring text; for(unsigned char c:thread_label)text.push_back(c); f(GetCurrentThread(),text.c_str()); }
+ #ifdef _WIN32
+ inline std::string utf8(const std::wstring& value) {
+@@ -71,6 +76,13 @@ inline void set_thread_name(const char* name) noexcept {
+   for(;name[n] && n+1<sizeof text/sizeof *text;++n) text[n]=(unsigned char)name[n];
+   text[n]=0; f(GetCurrentThread(),text);
+  }
 +#elif defined(__PROSPERO__)
 + // PlayStation 5: the label alone (get_thread_name reads it). Every thread of the runtime names
 + // itself first: a title's threads start with denormals flushed to zero, and the recompiled code
@@ -795,9 +1768,9 @@ index 7787a3f..42a39cd 100644
 + ps5_thread_place(name);    // a core each for the game's main thread and the render thread (ps5/src/threads_ps5.cpp)
 + ps5_sampler_thread(name);  // WWHD_PS5_SAMPLE (ps5/src/sampler_ps5.cpp); nothing without it
  #else
-  pthread_setname_np(pthread_self(),thread_label.substr(0,15).c_str());
- #endif
-@@ -77,6 +89,8 @@ inline void boost_thread_priority() {
+  char text[16]; snprintf(text,sizeof text,"%s",name); // Linux limit: 15 bytes + NUL.
+  pthread_setname_np(pthread_self(),text);
+@@ -95,6 +107,8 @@ inline void boost_thread_priority() {
    PowerThrottling state{1 /* THREAD_POWER_THROTTLING_CURRENT_VERSION */,1 /* EXECUTION_SPEED */,0 /* off */};
    set_info(GetCurrentThread(),3 /* ThreadPowerThrottling */,&state,sizeof state);
   }
@@ -806,29 +1779,29 @@ index 7787a3f..42a39cd 100644
  #else
   setpriority(PRIO_PROCESS,(id_t)syscall(SYS_gettid),-5);  // EPERM without CAP_SYS_NICE: ignored
  #endif
-@@ -102,6 +116,8 @@ inline uintptr_t executable_base() {
+@@ -120,6 +134,8 @@ inline uintptr_t executable_base() {
  inline std::string executable_path() {
  #ifdef _WIN32
-  char path[32768]; DWORD n=GetModuleFileNameA(nullptr,path,sizeof path);return std::string(path,n);
+  wchar_t path[32768]; DWORD n=GetModuleFileNameW(nullptr,path,32768);return utf8(std::wstring(path,n));
 +#elif defined(__PROSPERO__)
 + return "/app0/eboot.bin";  // PlayStation 5: a title's own folder is mounted at /app0
  #elif !defined(__APPLE__)
   char path[4096];ssize_t n=readlink("/proc/self/exe",path,sizeof path);return n>0?std::string(path,n):std::string();
  #else
-@@ -153,6 +169,8 @@ inline std::string exe_dir() {
+@@ -176,6 +192,8 @@ inline std::string exe_dir() {
    if(_NSGetExecutablePath(buf,&n)==0){ char real[PATH_MAX]; p=realpath(buf,real)?real:buf; }
  #elif defined(_WIN32)
-   char buf[MAX_PATH*4]; DWORD n=GetModuleFileNameA(nullptr,buf,sizeof buf); if(n>0&&n<sizeof buf) p.assign(buf,n);
+   p=executable_path();
 +#elif defined(__PROSPERO__)
 +  p="/app0/eboot.bin";
  #else
    char buf[4096]; ssize_t n=readlink("/proc/self/exe",buf,sizeof buf-1); if(n>0) p.assign(buf,(size_t)n);
  #endif
 diff --git a/runtime/src/platform/input_sdl.cpp b/runtime/src/platform/input_sdl.cpp
-index d1f200f..fd2ef3c 100644
+index 1792e23..3852d36 100644
 --- a/runtime/src/platform/input_sdl.cpp
 +++ b/runtime/src/platform/input_sdl.cpp
-@@ -575,7 +575,15 @@ void update(){
+@@ -654,7 +654,15 @@ void update(){
    auto button=[&](SDL_GamepadButton b,int p){put(p,SDL_GetGamepadButton(pad,b)?1.f:0.f);};
    button(SDL_GAMEPAD_BUTTON_SOUTH,kPadA);button(SDL_GAMEPAD_BUTTON_EAST,kPadB);button(SDL_GAMEPAD_BUTTON_WEST,kPadX);button(SDL_GAMEPAD_BUTTON_NORTH,kPadY);
    button(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,kPadLB);button(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER,kPadRB);
@@ -845,7 +1818,7 @@ index d1f200f..fd2ef3c 100644
    button(SDL_GAMEPAD_BUTTON_LEFT_STICK,kPadL3);button(SDL_GAMEPAD_BUTTON_RIGHT_STICK,kPadR3);
    button(SDL_GAMEPAD_BUTTON_DPAD_UP,kPadDUp);button(SDL_GAMEPAD_BUTTON_DPAD_DOWN,kPadDDown);button(SDL_GAMEPAD_BUTTON_DPAD_LEFT,kPadDLeft);button(SDL_GAMEPAD_BUTTON_DPAD_RIGHT,kPadDRight);
    put(kPadLT,std::max(0.f,SDL_GetGamepadAxis(pad,SDL_GAMEPAD_AXIS_LEFT_TRIGGER)/32767.f));put(kPadRT,std::max(0.f,SDL_GetGamepadAxis(pad,SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)/32767.f));
-@@ -752,7 +760,14 @@ static void apply_scenario(PadState& s) {
+@@ -854,7 +862,14 @@ static void apply_scenario(PadState& s) {
          if (t >= p.from && t < p.to) s.buttons |= p.bits;
  }
  
@@ -861,10 +1834,10 @@ index d1f200f..fd2ef3c 100644
  void set_pro_controller(bool on) { g_pro = on; LOG("[input] keyboard/controller act as %s", on ? "Pro Controller" : "GamePad"); }
  
 diff --git a/runtime/src/rtl_text_hooks.cpp b/runtime/src/rtl_text_hooks.cpp
-index 84c86fe..dca2a53 100644
+index 4b1f5e4..eafeae8 100644
 --- a/runtime/src/rtl_text_hooks.cpp
 +++ b/runtime/src/rtl_text_hooks.cpp
-@@ -48,6 +48,10 @@ void f_0286E8B4_orig(Cpu* c);  // CharWriter::PrintGlyph
+@@ -49,6 +49,10 @@ void f_0286E8B4_orig(Cpu* c);  // CharWriter::PrintGlyph
  void f_028785C8_orig(Cpu* c);  // lyt::TextBox::DrawSelf
  }
  
@@ -875,7 +1848,7 @@ index 84c86fe..dca2a53 100644
  namespace rtl_text {
  
  namespace {
-@@ -252,6 +256,16 @@ extern "C" void hook_02871328(Cpu* c) {
+@@ -253,6 +257,16 @@ extern "C" void hook_02871328(Cpu* c) {
  
  // TextWriterBase<wchar_t>::PrintImpl (r3 = writer, r4 = text, r5 = length; returns the width in f1)
  extern "C" void hook_028709E0(Cpu* c) {
@@ -912,10 +1885,10 @@ index 9443713..5421a87 100644
  namespace mem {
  constexpr uint32_t kMem2Start = 0x10000000;   // app data + heap (MEM2)
 diff --git a/runtime/src/threads.cpp b/runtime/src/threads.cpp
-index 00a77fc..89eb3d5 100644
+index 936ec0f..f10b4ee 100644
 --- a/runtime/src/threads.cpp
 +++ b/runtime/src/threads.cpp
-@@ -97,6 +97,9 @@ struct HostThread {
+@@ -98,6 +98,9 @@ struct HostThread {
      HANDLE pt = nullptr;
  #else
      pthread_t pt{};
@@ -925,7 +1898,7 @@ index 00a77fc..89eb3d5 100644
  #endif
      // scheduling
      int prio = 16;            // lower runs first; service threads (alarms, audio) use -1
-@@ -493,7 +496,8 @@ __attribute__((noinline)) static void try_entry_park(HostThread* t, Cpu* c) {
+@@ -494,7 +497,8 @@ __attribute__((noinline)) static void try_entry_park(HostThread* t, Cpu* c) {
          if (!g_frozen || t == g_frz_owner) return;
      }
      if (mode == 2 && (!t->has_target || c->r[1] != t->tgt_r1 || c->lr != t->tgt_lr)) return;
@@ -935,7 +1908,7 @@ index 00a77fc..89eb3d5 100644
      // Entry parking requires host-frame symbol classification; Windows stack unwinding needs
      // a dedicated implementation. Ordinary waits remain saveable; never guess a safe frame.
      return;
-@@ -596,6 +600,13 @@ void service_end() {
+@@ -597,6 +601,13 @@ void service_end() {
  }
  }  // namespace threads
  
@@ -949,7 +1922,7 @@ index 00a77fc..89eb3d5 100644
  static void* thread_main(void* p) {
      HostThread* ht = (HostThread*)p;
      t_self = ht;
-@@ -633,6 +644,9 @@ static void* thread_main(void* p) {
+@@ -634,6 +645,9 @@ static void* thread_main(void* p) {
      }
      ht->cv.notify_all();
      TRACE("[thread] %s exited with %08X", name.c_str(), rv);
@@ -959,7 +1932,7 @@ index 00a77fc..89eb3d5 100644
      return nullptr;
  }
  
-@@ -646,8 +660,15 @@ static void start_host_thread(HostThread* ht) {
+@@ -647,8 +661,15 @@ static void start_host_thread(HostThread* ht) {
  #else
      pthread_attr_t attr;
      pthread_attr_init(&attr);
@@ -976,10 +1949,10 @@ index 00a77fc..89eb3d5 100644
  #endif
  }
 diff --git a/runtime/src/true60.cpp b/runtime/src/true60.cpp
-index 0f6d623..5c56504 100644
+index f9faf39..877514d 100644
 --- a/runtime/src/true60.cpp
 +++ b/runtime/src/true60.cpp
-@@ -766,8 +766,8 @@ extern "C" void hook_025DF940(Cpu* c) {
+@@ -769,8 +769,8 @@ extern "C" void hook_025DF940(Cpu* c) {
              static int logged = 0;
              if (logged++ < 20) {
                  std::error_code directory_error;
@@ -991,7 +1964,7 @@ index 0f6d623..5c56504 100644
                              (unsigned long long)g_pass, (int)g_cam_nan, g_cam_nan_lr);
                      for (uint32_t o = kDCamera; o < kCamSnap; o += 4) {
 diff --git a/runtime/src/true60_test.cpp b/runtime/src/true60_test.cpp
-index e2d0ee0..fdb699f 100644
+index 02f60d1..49df078 100644
 --- a/runtime/src/true60_test.cpp
 +++ b/runtime/src/true60_test.cpp
 @@ -40,6 +40,7 @@
@@ -1002,7 +1975,7 @@ index e2d0ee0..fdb699f 100644
  
  namespace interp { uint64_t logic_steps(); uint64_t pass_count(); bool hold_pass(); }
  
-@@ -573,7 +574,11 @@ void wp_handler(int sig, siginfo_t* si, void* uc) {
+@@ -644,7 +645,11 @@ void wp_handler(int sig, siginfo_t* si, void* uc) {
      uintptr_t a = (uintptr_t)si->si_addr;
      if (a >= g_wp_lo && a < g_wp_hi) {
          char name[64] = "";
@@ -1014,7 +1987,7 @@ index e2d0ee0..fdb699f 100644
          Cpu* c = threads::current();
          char buf[200];
          int n = snprintf(buf, sizeof buf, "[wp] write %08X by \"%s\" guest lr=%08X\n", (unsigned)(a - (uintptr_t)PPC_MEM_BASE), name,
-@@ -641,7 +646,9 @@ extern "C" void hook_02753D6C(Cpu* c) {
+@@ -712,7 +717,9 @@ extern "C" void hook_02753D6C(Cpu* c) {
          std::lock_guard<std::mutex> lk(m);
          if (seen.insert({h, t}).second) {
              char name[64] = "";
@@ -1073,11 +2046,3 @@ index 064ac33..208ee66 100644
  
  // Explicit guest signals (see above). hint() is a no-op until enable_hints(); any thread. Ranges of
  // 256 MiB or more ("everything") are ignored, as GX2Invalidate's texture handling does.
-diff --git a/tools/recomp/hooks_ps5.txt b/tools/recomp/hooks_ps5.txt
-new file mode 100644
-index 0000000..9380fa7
---- /dev/null
-+++ b/tools/recomp/hooks_ps5.txt
-@@ -0,0 +1,2 @@
-+# PlayStation 5 (ps5/src/controller_ps5.cpp). @ADDR = instruction hook.
-+@02618094 # ControllerMgr: set the controller mode (r4: 0 Pro Controller, 1 or 2 GamePad, 3 both): entry
