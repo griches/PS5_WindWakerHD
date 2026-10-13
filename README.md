@@ -29,7 +29,7 @@ read in the console's log; nothing else is claimed.
 | --- | --- | --- |
 | Start-up | Boots to the title screen; a new Quest Log through the prologue and the first cutscene into play; a saved Quest Log continued after a restart | |
 | Rendering | 3840x2160 output on a 59.94 Hz display; the title screen, menus, the prologue, the first island and its characters look right; the recompilation's renderer self-test passes | Anything past the first island; a comparison with a Wii U, frame for frame; 120 Hz |
-| Frame rate | 60 fps (frame interpolation, "Keep game speed") on the first island: standing on the beach by the pier and walking along it with the camera turning, every in-between frame is drawn (59.9 to 60.0 frames and 29.9 to 30.0 game steps a second over 100-second runs; frame intervals 16.7 ms at the median, 95th and 99th percentile, a rare one of 20 to 30 ms) | A long session; later, heavier areas |
+| Frame rate | 60 fps (frame interpolation, "Keep game speed") on the first island, the game at full speed: on the beach and the pier, and in the view from the pier across the village with the pirate ship in the bay, the heaviest found (4,350 draws a pass), standing and with the camera turning: every in-between frame drawn, 59.7 to 60.1 frames and 29.9 to 30.1 game steps a second over 100-second runs, frame intervals 16.7 ms at the median and 18 ms at the 95th percentile | A long session; later, heavier areas |
 | 30 fps | The game's own rate, chosen in Settings: 30.0 frames and 30.0 game steps a second on the island's pier | |
 | Settings | Opened with the touchpad button and driven from the pad: tabs, frame rate, internal resolution, save states; choices kept across a restart | Every option in it |
 | Text entry | The console's own keyboard for the name of a new Quest Log, and the name it gave back in the game | |
@@ -41,19 +41,16 @@ read in the console's log; nothing else is claimed.
 
 Known limits:
 
-- **60 fps is frame interpolation, with some headroom.** The game runs 30
-  steps a second and each is drawn twice. On the first island's beach a pass is
-  about 5,800 draws and 13 ms of the render thread, which leaves it idle about
-  3.5 ms a frame; walking along the pier it is 10 to 11 ms. A heavier scene will
-  show 30 frames a second again (the in-between frame is left out and the game
-  keeps its speed) until passes get cheaper: the thread spends about 3.7
-  microseconds a draw, spread over the shader lookup, the uniforms, the
-  textures and the register writes ("How it works" below has what was cut;
-  `ps5/src/sampler_ps5.cpp` has the profiler). The game cannot run ahead of the
-  render thread to make room (tried: the render thread read a surface the game
-  had reused). Keeping the step's shadow maps for the in-between frame flickered
-  (their parameters do not match); `WWHD_PS5_HOLD_SHADOWS=1` in `env.txt` turns
-  that experiment on.
+- **60 fps is frame interpolation.** The game runs 30 steps a second and each
+  is drawn twice; the in-between frame reuses the step's shadow maps (below),
+  so it costs the render thread about half of a full pass. In the heaviest view
+  found on the first island a full pass is 16 ms and the two of a step average
+  10 ms a frame, which leaves the thread idle 6 to 7 ms. What moves casts a
+  shadow that is one frame (16 ms) old in the in-between frame. A view whose
+  full pass alone no longer fits would show 30 frames a second again (the
+  in-between frame is left out and the game keeps its speed). The game cannot
+  run ahead of the render thread to make room (tried: the render thread read a
+  surface the game had reused).
 - **Nothing past the first island has been measured.**
 - **Button symbols: the HUD and menus, in English.** The game prints a button's
   letter as text over a blank button, in the font of every other HUD label. The
@@ -256,15 +253,35 @@ What the console needed, each found on it and explained where it is handled:
   (`runtime/src/gx2/state_groups.h` says which registers end a run). 47 to 63%
   of draws continued on the beach, a 100-second verify run found no mismatch,
   and a pass went from 15 to 13 ms standing and from 11.5 to 10.5 ms walking.
-- **Shadow distance.** The game draws every object in view into three shadow
-  cascades, a third of the island's draws each. The farthest cascade is left
-  out (its clear stays, so it casts nothing): in a view across the island that
-  took a pass from 15.3 to 13.7 ms, from flapping between 30 and 58 fps to a
-  steady 60; what goes is the long shadow of a distant cliff, and Link's own
-  shadow and everything near stay. `WWHD_PS5_SHADOW_SKIP=0` in `env.txt`
-  draws all three (the value is a mask of slices to leave out). Also, the
-  renderer's reuse check of packed uniform blocks is off here (it rarely hit
-  and cost 0.4 ms a pass; `WWHD_VK_REUSE_UNIFORM_SNAPSHOTS=1` turns it on).
+- **In-between frames on the step's shadow maps.** More than half of a pass's
+  draws fill the three shadow cascades, and at 60 fps they were filled twice a
+  step. On an in-between pass those draws and their clears are left out. The
+  game applies its shadows in one full-screen draw (the sun shadow mask), whose
+  uniform block holds for each cascade the matrix from view space to that
+  cascade's map, bias * light * inverse view; it fits the cascades to the
+  camera, so the in-between frame's own matrices belong to maps that were not
+  drawn (the first attempt used them: whole surfaces went dark whenever the
+  camera turned). The light matrices are taken from the shadow-map draws of the
+  step's own frame, checked against that frame's mask, and the in-between
+  frame's mask gets bias * that light * its own inverse view
+  (`runtime/src/gfx/vulkan/draw.cpp`, `ps5_mask_seen`). A step whose check
+  fails (a few in a hundred) draws its maps in the in-between frame as before.
+  The view across the village went from 33 fps to 60, standing and turning.
+  `WWHD_PS5_HOLD_SHADOWS=0` turns it off; `WWHD_PS5_HOLD_SHADOWS_LOG=1` logs
+  what it did; `WWHD_PS5_SHADOW_DUMP=<frame>` writes the uniforms it relies on.
+- **Vertex data is copied once for the passes that draw it.** The game sends
+  about 190 invalidations a frame, nearly all for textures and render targets;
+  only those for attribute buffers now end the reuse of a copied vertex range
+  (12% of repeated ranges were reused before, a third after). Direct-mapped
+  front caches sit ahead of the hash maps of the vertex-buffer cache and the
+  shader lookup.
+- **Not taken: shadow distance.** Leaving out the farthest of the three shadow
+  cascades (`WWHD_PS5_SHADOW_SKIP=4` in `env.txt`, a mask of slices; off by
+  default) saves about a third of the shadow draws, 1.6 ms of a 15 ms pass in a
+  view across the island, but loses the long shadows of distant cliffs, and a
+  heavier view still fell to 30 fps with it: not worth the look, Gary decided.
+  The renderer's reuse check of packed uniform blocks is off here (it rarely
+  hit and cost 0.4 ms a pass; `WWHD_VK_REUSE_UNIFORM_SNAPSHOTS=1` turns it on).
 - **The game's code is built with `-fwrapv`** (upstream PR #172): PowerPC
   integer arithmetic wraps, and the compiler now guarantees the same for the
   recompiled code instead of relying on it never overflowing.

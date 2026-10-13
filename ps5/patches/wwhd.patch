@@ -263,7 +263,7 @@ index 9b00d41..ffd0fdf 100644
  }
  static bool close_request(const SDL_Event& event) {
 diff --git a/runtime/src/gfx/vulkan/backend.h b/runtime/src/gfx/vulkan/backend.h
-index 518aad8..0e7272d 100644
+index 518aad8..36d7ebf 100644
 --- a/runtime/src/gfx/vulkan/backend.h
 +++ b/runtime/src/gfx/vulkan/backend.h
 @@ -205,6 +205,14 @@ void begin_pipeline_pending_frame();
@@ -274,7 +274,7 @@ index 518aad8..0e7272d 100644
 +void guest_flush();
 +// draw.cpp: the vertex copies of one GX2DrawDone interval (guest_flush ends it)
 +extern uint64_t ps5VertexInterval;
-+void ps5_vertex_invalidate(uint32_t addr, uint32_t size);
++void ps5_vertex_invalidate(uint32_t flags, uint32_t addr, uint32_t size);
 +// draw.cpp: on an in-between pass, the shadow maps' depth target (which is not drawn again)
 +bool ps5_skip_shadow_target(uint32_t depthAddress);
 +#endif
@@ -315,8 +315,78 @@ index d51fbac..1bb1743 100644
          b.wait_idle = gfxvk::wait_idle;
          b.write_back = gfxvk::write_back_linear_targets;
          b.ss_reset = [] {
+diff --git a/runtime/src/gfx/vulkan/buffer_cache_core.h b/runtime/src/gfx/vulkan/buffer_cache_core.h
+index 1f4631e..7191448 100644
+--- a/runtime/src/gfx/vulkan/buffer_cache_core.h
++++ b/runtime/src/gfx/vulkan/buffer_cache_core.h
+@@ -36,6 +36,7 @@
+ #pragma once
+ #include <algorithm>
+ #include <atomic>
++#include <array>
+ #include <cstdint>
+ #include <cstring>
+ #include <map>
+@@ -192,8 +193,26 @@ class Cache {
+   Status lookup(const Key& key, uint32_t size, Entry*& e) {
+     ++stats.lookups;
+     const uint32_t epoch = epoch_.load(std::memory_order_acquire);
++#ifdef __PROSPERO__
++    // PlayStation 5: a direct-mapped front cache ahead of the map. The island's draws look up about
++    // 13,000 ranges a frame, each range about five times (shadow, depth and colour passes), and the
++    // map's hashing and bucket walk were 2 ms of a 15 ms pass. Entries are nodes of the map (stable)
++    // and go only through end_frame and clear, which empty the front cache.
++    Front& f = front_[KeyHash{}(key) & (front_.size() - 1)];
++    bool inserted = false;
++    if (f.e && f.key == key) {
++      e = f.e;
++    } else {
++      auto [it, made] = map_.try_emplace(key);
++      inserted = made;
++      e = &it->second;
++      f.key = key;
++      f.e = e;
++    }
++#else
+     auto [it, inserted] = map_.try_emplace(key);
+     e = &it->second;
++#endif
+     Entry& x = *e;
+     x.lastUse = frame_;
+     if (inserted) {
+@@ -287,6 +306,9 @@ class Cache {
+     if (!over && frame_ - lastSweep_ < 64) return;
+     lastSweep_ = frame_;
+     pressure_ = false;
++#ifdef __PROSPERO__
++    for (auto& f : front_) f.e = nullptr;  // entries may go below
++#endif
+     for (auto it = map_.begin(); it != map_.end();) {
+       Entry& x = it->second;
+       if (x.lastUse + kIdleFrames < frame_ && frame_ >= x.dynamicUntil) {
+@@ -311,6 +333,9 @@ class Cache {
+   void clear() {
+     for (auto& [k, x] : map_) drop_region(x);
+     map_.clear();
++#ifdef __PROSPERO__
++    for (auto& f : front_) f.e = nullptr;
++#endif
+   }
+ 
+   uint64_t resident_bytes() const { return resident_; }
+@@ -352,6 +377,10 @@ class Cache {
+ 
+   Backing& backing_;
+   std::unordered_map<Key, Entry, KeyHash> map_;
++#ifdef __PROSPERO__
++  struct Front { Key key; Entry* e = nullptr; };
++  std::array<Front, 8192> front_{};
++#endif
+   std::atomic<uint32_t> epoch_{0};
+   uint64_t frame_ = 0, lastSweep_ = 0, resident_ = 0;
+   bool pressure_ = false;
 diff --git a/runtime/src/gfx/vulkan/draw.cpp b/runtime/src/gfx/vulkan/draw.cpp
-index 79e67a5..3c6af6b 100644
+index 79e67a5..46c1746 100644
 --- a/runtime/src/gfx/vulkan/draw.cpp
 +++ b/runtime/src/gfx/vulkan/draw.cpp
 @@ -10,6 +10,7 @@
@@ -375,7 +445,7 @@ index 79e67a5..3c6af6b 100644
  UploadSlice snapshot(const void *data, size_t size, VkDeviceSize alignment) {
    auto slice = allocate_upload(std::max<size_t>(size, 16), alignment);
    // Every allocation owns its bytes until the submission fence completes.
-@@ -138,6 +165,84 @@ UploadSlice snapshot(const void *data, size_t size, VkDeviceSize alignment) {
+@@ -138,6 +165,96 @@ UploadSlice snapshot(const void *data, size_t size, VkDeviceSize alignment) {
    return slice;
  }
  
@@ -447,7 +517,19 @@ index 79e67a5..3c6af6b 100644
 +}
 +} // namespace
 +// GX2Invalidate, as the render thread executes it (surfaces.cpp)
-+void ps5_vertex_invalidate(uint32_t addr, uint32_t size) {
++void ps5_vertex_invalidate(uint32_t flags, uint32_t addr, uint32_t size) {
++  // Only an invalidation of attribute buffers (GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, bit 0) says
++  // vertex data changed. The game also invalidates "everything" about 190 times a frame for other
++  // kinds (CPU caches, textures, shaders); counting those ended the interval 190 times a frame and
++  // left 12% of the repeated ranges reused. The contract still holds within a submission: the game
++  // waits at GX2DrawDone before it rewrites a buffer the draws read (gx2_core.cpp, render_sync).
++  static uint64_t kinds[8];
++  ++kinds[__builtin_ctz(flags | 0x80) & 7];
++  if (++kinds[7] % 60000 == 0)
++    LOG("[vulkan] invalidations: attribute %llu texture %llu uniform %llu shader %llu colour %llu depth %llu cpu %llu of %llu",
++        (unsigned long long)kinds[0], (unsigned long long)kinds[1], (unsigned long long)kinds[2], (unsigned long long)kinds[3],
++        (unsigned long long)kinds[4], (unsigned long long)kinds[5], (unsigned long long)kinds[6], (unsigned long long)kinds[7]);
++  if (!(flags & 1)) return;
 +  if (!size || size >= 0x10000000u) { ++ps5VertexInterval; return; }  // "everything"
 +  if (ps5InvalidateStamp.empty()) ps5InvalidateStamp.assign(size_t(1) << 20, 0);
 +  ++ps5InvalidateClock;
@@ -460,7 +542,7 @@ index 79e67a5..3c6af6b 100644
  UploadSlice vertex_snapshot(uint32_t binding, uint32_t address, uint32_t size,
                              bool bounded) {
    static const bool enabled = [] {
-@@ -161,6 +266,10 @@ UploadSlice vertex_snapshot(uint32_t binding, uint32_t address, uint32_t size,
+@@ -161,6 +278,10 @@ UploadSlice vertex_snapshot(uint32_t binding, uint32_t address, uint32_t size,
        }
      }
    }
@@ -471,7 +553,7 @@ index 79e67a5..3c6af6b 100644
    if (!enabled)
      return snapshot(mem::ptr(address), size, 4);
    static const bool historyEnabled = [] {
-@@ -232,6 +341,16 @@ UploadSlice vertex_window_snapshot(uint32_t binding,uint32_t address,uint32_t re
+@@ -232,6 +353,16 @@ UploadSlice vertex_window_snapshot(uint32_t binding,uint32_t address,uint32_t re
      return e && !std::strcmp(e,"1");}();
    Entry* entry=reuse && binding<entries.size()?&entries[binding]:nullptr;
    const auto* fresh=static_cast<const uint8_t*>(source?source:mem::ptr(address))+begin;
@@ -488,7 +570,7 @@ index 79e67a5..3c6af6b 100644
    // compares the entry's CPU copy of the window, not the mapped slice, unless the entry was made with
    // direct reads (host-cached upload memory; vertex_snapshot_history.h)
    if(entry && entry->matches(address,reservation,begin,length)) {
-@@ -1697,10 +1816,257 @@ VkImageView feedback_view(Surface *source, const uint32_t *textureWords,
+@@ -1697,10 +1828,288 @@ VkImageView feedback_view(Surface *source, const uint32_t *textureWords,
    destroy_surface_image(&temporary); // Temporary snapshots remain fence-retired.
    return view;
  }
@@ -615,6 +697,37 @@ index 79e67a5..3c6af6b 100644
 +static bool ps5HoldPass = false;      // the in-between pass's shadow maps are the step's (below)
 +static uint32_t ps5ShadowDepth = 0;
 +static uint64_t ps5ShadowSkipped = 0;
++// Held shadow maps (ps5_set_hold_pass, below): what the in-between frame needs to use them.
++static float ps5LightVP[3][16];          // each cascade's light matrix, from the step's own frame
++static uint32_t ps5LightCaptured = 0;    // bits: the cascades captured in this step's frame
++static bool ps5ShadowsVerified = false;  // that frame's shadow mask matched bias * light * inverse view
++static bool ps5MaskDraw = false;         // the draw being prepared is the sun shadow mask
++static uint32_t ps5MaskBlock = 0;        // its uniform block
++static uint64_t ps5MaskPatched = 0, ps5MaskRejected = 0, ps5MaskSeen = 0, ps5RejectNoBlock = 0, ps5RejectCaptured = 0, ps5ShadowDrawsSeen = 0;
++static bool ps5_hold_shadows_on() {
++  static const bool on = [] { const char* e = std::getenv("WWHD_PS5_HOLD_SHADOWS"); return !e || std::strcmp(e, "0") != 0; }();
++  return on;
++}
++// out = bias * light * inverseView (row-major, column vectors): the bias takes clip space to the
++// shadow map's texture space (x/2 + 1/2, -y/2 + 1/2, z/2 + 1/2)
++static void ps5_mask_matrix(const float* light, const float* inverseView, float* out) {
++  float lv[16];
++  for (int row = 0; row < 4; ++row)
++    for (int col = 0; col < 4; ++col) {
++      float sum = 0;
++      for (int k = 0; k < 4; ++k) sum += light[row * 4 + k] * inverseView[k * 4 + col];
++      lv[row * 4 + col] = sum;
++    }
++  for (int col = 0; col < 4; ++col) {
++    out[col] = 0.5f * lv[col] + 0.5f * lv[12 + col];
++    out[4 + col] = -0.5f * lv[4 + col] + 0.5f * lv[12 + col];
++    out[8 + col] = 0.5f * lv[8 + col] + 0.5f * lv[12 + col];
++    out[12 + col] = lv[12 + col];
++  }
++}
++// The mask's block (768 bytes of floats): rows 2-5 the inverse view matrix, rows 10-13, 14-17 and
++// 18-21 the three cascades' matrices from view space to their shadow map.
++constexpr uint32_t kPs5MaskBlockBytes = 768, kPs5MaskInverseView = 8, kPs5MaskCascade0 = 40;
 +#endif
 +bool resolve_targets(const uint32_t* r, vk::Shader* ps, DrawTargets& t) {
 +  t = {};
@@ -747,7 +860,7 @@ index 79e67a5..3c6af6b 100644
    StageResources out;
    auto &m = sh->mapping;
    // Descriptor info pointers must remain stable until this stage's one update.
-@@ -1759,7 +2125,15 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+@@ -1759,7 +2168,15 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
      UploadSlice cachedSlice;
      const bool cached = guestAddr && buffer_cache_enabled() &&
          cached_guest_range(guestAddr, uint32_t(size), rprof::kUpUbo, cachedSlice);
@@ -763,7 +876,7 @@ index 79e67a5..3c6af6b 100644
          : reuseUniforms
          ? uniformCache.get(R.device, R.submissionGeneration,
                             (sh->vertex ? 0 : 17) + logicalSlot, bytes, size,
-@@ -1840,6 +2214,32 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+@@ -1840,6 +2257,32 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
    rprof::mark(rprof::kUniforms);
    uint32_t texbase = sh->vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS
                                  : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS;
@@ -796,7 +909,7 @@ index 79e67a5..3c6af6b 100644
    for (int i = 0; i < sh->dec->textureUnitListCount; i++) {
      uint32_t unit = sh->dec->textureUnitList[i];
      if (unit >= LATTE_NUM_MAX_TEX_UNITS)
-@@ -1847,24 +2247,9 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+@@ -1847,24 +2290,9 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
      int binding = m.textureUnitToBindingPoint[unit];
      if (binding < 0)
        continue;
@@ -824,7 +937,7 @@ index 79e67a5..3c6af6b 100644
      VkImageView sampledView =
          aliases ? feedback_view(s, r + texbase + unit * 7, sh->vertex, unit, feedbackProbe)
                  : sampled_texture_view(s, r + texbase + unit * 7);
-@@ -1876,31 +2261,12 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+@@ -1876,31 +2304,12 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
                             : (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT),
                         VK_ACCESS_SHADER_READ_BIT);
@@ -862,7 +975,7 @@ index 79e67a5..3c6af6b 100644
    }
    rprof::mark(rprof::kTextures);
    if (m.uniformVarsBufferBindingPoint >= 0)
-@@ -1963,6 +2329,74 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+@@ -1963,6 +2372,74 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
    remember_descriptors(last, layout, out.set, writes.data(), writeCount);
    return out;
  }
@@ -937,7 +1050,7 @@ index 79e67a5..3c6af6b 100644
  } // namespace
  void reset_feedback_images() { reset_feedback_scratch(); }
  UploadSlice vertex_window_smoke_snapshot(uint32_t binding,uint32_t address,
-@@ -1979,7 +2413,7 @@ void reset_ao_private_cache() { aoPrivateFrame = ~0ull; aoPrivateSource = 0; }
+@@ -1979,7 +2456,7 @@ void reset_ao_private_cache() { aoPrivateFrame = ~0ull; aoPrivateSource = 0; }
  void drain_pending_guest_pipelines() {
    for (auto& [key, value] : pipelines) resolve_pending_pipeline(value);
  }
@@ -946,7 +1059,7 @@ index 79e67a5..3c6af6b 100644
  uint64_t draw_batch_submissions() { return drawBatchSubmissions; }
  // WWHD_VK_TRACE_PASSES=1 (issue #144): log each new render pass shape once, just before the driver
  // sees it, so a crash inside vkCmdBeginRendering names the last pass in the crash report's log lines
-@@ -2008,20 +2442,96 @@ static void trace_pass(const std::array<Surface *, 8> &colors, uint32_t ncolor,
+@@ -2008,20 +2485,219 @@ static void trace_pass(const std::array<Surface *, 8> &colors, uint32_t ncolor,
              (depth->fmt.stencil ? "/stencil" : "");
    LOG("[vulkan pass] %ux%u, %u colour attachment(s)%s", width, height, ncolor, text.c_str());
  }
@@ -954,30 +1067,143 @@ index 79e67a5..3c6af6b 100644
 +// PlayStation 5: in-between frames keep the step's shadow maps.
 +//
 +// At 60 fps every step of the game is drawn twice (frame interpolation: interp.cpp), each pass in
-+// full. On the first island's pier that is 5,150 draws a pass, and 2,739 of them fill the shadow
-+// maps: three 1024x1024 slices of one depth array, drawn with no colour target. The render thread
-+// needs about 19 ms for such a pass, the two of a step do not fit in a thirtieth of a second, and
-+// the game cannot run ahead of the render thread to make room (it reads guest memory as it draws).
++// full, and more than half of a pass's draws fill the shadow maps: three 1024x1024 slices of one
++// depth array (the cascades), drawn with no colour target. Two full passes of a view across the
++// first island do not fit in a thirtieth of a second on the render thread.
 +//
 +// So on an in-between pass the draws into that depth array, and its clears (surfaces.cpp), are
-+// left out: the maps of the step's first pass stay, 16 ms old for what moved. The array is the one
-+// the last full pass drew into without a colour target (ps5ShadowDepth); which kind of pass this
-+// is comes from the swap before it (gx2_core.cpp). WWHD_PS5_HOLD_SHADOWS=1 turns this on.
++// left out: the maps of the step's own frame stay, 16 ms old for what moved. The game applies its
++// shadows in one full-screen draw, the sun shadow mask, whose uniform block holds for each cascade
++// the matrix from view space to that cascade's map: bias * light * inverseView. The in-between
++// frame has another camera, and the game fits the cascades to the camera, so its own three
++// matrices belong to maps that were not drawn (used with the kept maps, whole surfaces went dark
++// whenever the camera turned: the first attempt, 2026-10-11). Here the light matrices are taken
++// from the shadow-map draws of the step's frame (their uniform block 2), checked against that
++// frame's mask, and the in-between frame's mask gets bias * thatLight * itsOwnInverseView.
++// A step whose check fails draws its shadow maps in the in-between frame as before.
++// WWHD_PS5_HOLD_SHADOWS=0 turns all of this off.
++static void ps5_capture_light(const uint32_t* r) {
++  const uint32_t slice = r[mmDB_DEPTH_VIEW] & 0x7FF;
++  if (slice >= 3 || ((ps5LightCaptured >> slice) & 1)) return;
++  const uint32_t addr = r[mmSQ_VTX_UNIFORM_BLOCK_START + 2 * 7], size = r[mmSQ_VTX_UNIFORM_BLOCK_START + 2 * 7 + 1] + 1;
++  if (!addr || size != 512) return;  // (another vertex shader's layout: a later draw of the slice has it)
++  std::memcpy(ps5LightVP[slice], mem::ptr(addr + 48), 64);  // rows 3-6
++  ps5LightCaptured |= 1u << slice;
++}
++static bool ps5_is_shadow_mask(const uint32_t* r);
++// the sun shadow mask's draw: note its block; in a step's own frame, check the captured matrices
++static void ps5_mask_seen(const uint32_t* r) {
++  const uint32_t addr = r[mmSQ_PS_UNIFORM_BLOCK_START + 7], size = r[mmSQ_PS_UNIFORM_BLOCK_START + 8] + 1;
++  ps5MaskBlock = addr && size == kPs5MaskBlockBytes ? addr : 0;
++  ++ps5MaskSeen;
++  if (ps5HoldPass) {
++    // An in-between frame on the step's maps: its mask gets those maps' matrices. The shader reads
++    // the block from guest memory (as packed uniforms, or as a bound block), so they are written
++    // there: the game rebuilds the block for every frame and reads nothing back from it.
++    if (ps5ShadowsVerified && ps5MaskBlock) {
++      float block[kPs5MaskCascade0 + 48];
++      std::memcpy(block, mem::ptr(addr), sizeof block);
++      for (int k = 0; k < 3; ++k)
++        ps5_mask_matrix(ps5LightVP[k], block + kPs5MaskInverseView, block + kPs5MaskCascade0 + 16 * k);
++      wwatch::HostWrite writing(addr + kPs5MaskCascade0 * 4, 48 * 4);
++      std::memcpy(mem::ptr(addr + kPs5MaskCascade0 * 4), block + kPs5MaskCascade0, 48 * 4);
++      ++ps5MaskPatched;
++    }
++    return;
++  }
++  if (!ps5MaskBlock) ++ps5RejectNoBlock;
++  else if (ps5LightCaptured != 7) ++ps5RejectCaptured;
++  bool ok = ps5MaskBlock && ps5LightCaptured == 7;
++  if (ok) {
++    float block[kPs5MaskCascade0 + 48];
++    std::memcpy(block, mem::ptr(addr), sizeof block);
++    for (int k = 0; k < 3 && ok; ++k) {
++      float expected[16];
++      ps5_mask_matrix(ps5LightVP[k], block + kPs5MaskInverseView, expected);
++      const float* game = block + kPs5MaskCascade0 + 16 * k;
++      for (int row = 0; row < 4 && ok; ++row) {
++        float size = 1e-3f;
++        for (int col = 0; col < 4; ++col) size = std::max(size, std::fabs(game[row * 4 + col]));
++        for (int col = 0; col < 4; ++col)
++          if (!(std::fabs(game[row * 4 + col] - expected[row * 4 + col]) <= 2e-3f * size)) ok = false;
++      }
++    }
++  }
++  ps5ShadowsVerified = ok;
++  if (!ok) ++ps5MaskRejected;
++}
 +void ps5_set_hold_pass(bool hold) {
 +  static uint64_t passes;
-+  if (hold && ++passes % 3000 == 0 && preparation_stats_enabled())  // (WWHD_VK_STATS)
-+    LOG("[vulkan] in-between passes: %llu so far, %.0f shadow-map draws left out of each (the maps at %08X)",
-+        (unsigned long long)passes, double(std::exchange(ps5ShadowSkipped, 0)) / 3000.0, ps5ShadowDepth);
++  static const uint64_t every = std::getenv("WWHD_PS5_HOLD_SHADOWS_LOG") ? 60 : 1800;
++  if (hold && ++passes % every == 0)
++    LOG("[vulkan] in-between passes: %llu so far; of the last %llu, %.0f shadow-map draws left out of each, the shadow mask rebuilt %llu times, masks seen %llu, steps not verified %llu (no block %llu, cascades missing %llu), shadow draws seen %llu (the maps at %08X)",
++        (unsigned long long)passes, (unsigned long long)every, double(std::exchange(ps5ShadowSkipped, 0)) / double(every),
++        (unsigned long long)std::exchange(ps5MaskPatched, 0), (unsigned long long)std::exchange(ps5MaskSeen, 0),
++        (unsigned long long)std::exchange(ps5MaskRejected, 0), (unsigned long long)std::exchange(ps5RejectNoBlock, 0),
++        (unsigned long long)std::exchange(ps5RejectCaptured, 0), (unsigned long long)std::exchange(ps5ShadowDrawsSeen, 0), ps5ShadowDepth);
++  if (!hold) {  // a step's own frame begins: its cascades are captured and verified afresh
++    ps5LightCaptured = 0;
++    ps5ShadowsVerified = false;
++  }
 +  ps5HoldPass = hold;
 +}
 +bool ps5_skip_shadow_target(uint32_t depthAddress) {
-+  // Off unless asked for: the in-between frame's shadow parameters do not match the held maps, and
-+  // whole surfaces go dark for a frame whenever the camera moves.
-+  static const bool on = [] { const char* e = std::getenv("WWHD_PS5_HOLD_SHADOWS"); return e && std::strcmp(e, "1") == 0; }();
-+  return on && ps5HoldPass && depthAddress && depthAddress == ps5ShadowDepth;
++  // Only after the step's own frame showed that its mask is bias * light * inverse view for the
++  // light matrices captured from its shadow-map draws: otherwise the maps are drawn as usual.
++  return ps5_hold_shadows_on() && ps5HoldPass && ps5ShadowsVerified && depthAddress && depthAddress == ps5ShadowDepth;
 +}
 +#endif
 +
++#ifdef __PROSPERO__
++// debug: WWHD_PS5_SHADOW_DUMP=<frame> writes, for the eight frames from that one, the uniforms of
++// the sun shadow mask's draw and of the first draw into each shadow-map slice to
++// /app0/userdata/shadowdump.txt (which pass kind, the stage's register constants and uniform blocks)
++static bool ps5_is_shadow_mask(const uint32_t* r) {
++  const uint32_t address = r[mmSQ_PGM_START_PS] << 8, size = r[mmSQ_PGM_START_PS + 1] << 3;
++  if (size != 2112 || !address) return false;
++  static uint32_t known = 0, notMask = 0;
++  if (address == known) return true;
++  if (address == notMask) return false;
++  if (gfx::area_sample::program_hash(mem::ptr(address), size) == 0x62ae9ab4cb625546ull) { known = address; return true; }
++  notMask = address;
++  return false;
++}
++static void ps5_shadow_dump(const uint32_t* r) {
++  static const long first = [] { const char* e = std::getenv("WWHD_PS5_SHADOW_DUMP"); return e && *e ? std::atol(e) : -1L; }();
++  if (first < 0 || long(R.frame) < first || long(R.frame) >= first + 8) return;
++  static FILE* out = fopen("/app0/userdata/shadowdump.txt", "w");
++  if (!out) return;
++  const bool mask = ps5_is_shadow_mask(r);
++  const bool shadow = !mask && r[gx2::kDepthSlicesReg] > 1 && r[mmDB_DEPTH_BASE] && r[mmDB_DEPTH_BASE] == ps5ShadowDepth;
++  if (!mask && !shadow) return;
++  static uint64_t lastFrame = ~0ull; static uint32_t seen = 0;
++  if (lastFrame != R.frame) { lastFrame = R.frame; seen = 0; }
++  const uint32_t slice = shadow ? (r[mmDB_DEPTH_VIEW] & 0x7FF) : 31;
++  if (seen & (1u << (slice & 31))) return;
++  seen |= 1u << (slice & 31);
++  fprintf(out, "P frame %llu hold %d %s slice %u vs %08X ps %08X\n", (unsigned long long)R.frame, int(ps5HoldPass),
++          mask ? "MASK" : "SHADOW", slice, r[mmSQ_PGM_START_VS] << 8, r[mmSQ_PGM_START_PS] << 8);
++  for (int stage = 0; stage < 2; ++stage) {  // 0: pixel, 1: vertex
++    const uint32_t alu = mmSQ_ALU_CONSTANT0_0 + (stage ? 0x400 : 0);
++    for (uint32_t i = 0; i < 256; ++i) {
++      const uint32_t* w = r + alu + i * 4;
++      if (!(w[0] | w[1] | w[2] | w[3])) continue;
++      float f[4]; std::memcpy(f, w, 16);
++      fprintf(out, "A %s %u %.9g %.9g %.9g %.9g\n", stage ? "vs" : "ps", i, f[0], f[1], f[2], f[3]);
++    }
++    const uint32_t block = stage ? mmSQ_VTX_UNIFORM_BLOCK_START : mmSQ_PS_UNIFORM_BLOCK_START;
++    for (uint32_t i = 0; i < 16; ++i) {
++      const uint32_t addr = r[block + i * 7], size = r[block + i * 7 + 1] + 1;
++      if (!addr || size > 0x10000) continue;
++      fprintf(out, "B %s %u %08X %u", stage ? "vs" : "ps", i, addr, size);
++      const uint32_t n = std::min<uint32_t>(size, 1024) / 4;
++      for (uint32_t k = 0; k < n; ++k) { float f; std::memcpy(&f, mem::ptr(addr + k * 4), 4); fprintf(out, " %.9g", f); }
++      fputc('\n', out);
++    }
++  }
++  fflush(out);
++}
++#endif
  void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
            uint32_t indexAddr, uint32_t baseVertex, uint32_t instances) {
 +  const uint32_t dirtyGroups = gx2::take_dirty_groups();  // register groups changed since the previous draw
@@ -986,10 +1212,20 @@ index 79e67a5..3c6af6b 100644
    if (r[REGADDR::PA_CL_CLIP_CNTL] & (1 << 22))
      return;
 +#ifdef __PROSPERO__
-+  if (ps5_skip_shadow_target(r[mmDB_DEPTH_BASE]) && r[gx2::kDepthSlicesReg] > 1) {
-+    ++ps5ShadowSkipped;
-+    return;
++  ps5MaskDraw = ps5_is_shadow_mask(r);
++  if (ps5MaskDraw) {
++    if (ps5_hold_shadows_on()) ps5_mask_seen(r);
++  } else if (r[gx2::kDepthSlicesReg] > 1 && r[mmDB_DEPTH_BASE] && r[mmDB_DEPTH_BASE] == ps5ShadowDepth) {
++    ++ps5ShadowDrawsSeen;
++    if (ps5_skip_shadow_target(r[mmDB_DEPTH_BASE])) {
++      ++ps5ShadowSkipped;
++      return;
++    }
++    if (!ps5HoldPass && ps5_hold_shadows_on()) ps5_capture_light(r);
 +  }
++#endif
++#ifdef __PROSPERO__
++  ps5_shadow_dump(r);  // debug: WWHD_PS5_SHADOW_DUMP=<first frame>
 +#endif
    ((uint32_t *)r)[REGADDR::VGT_PRIMITIVE_TYPE] = prim;
 +  // continued-draw fast path (see fastpath_config); the AO replay draw stays outside of it
@@ -1049,7 +1285,7 @@ index 79e67a5..3c6af6b 100644
    rprof::mark(rprof::kShader);
    if (!vs || !vs->ready() || !ps || !ps->ready())
      exception_report::raise("Vulkan shader translation failed: " +
-@@ -2189,52 +2699,31 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2189,52 +2865,31 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
      }
    }
    rprof::mark(rprof::kIndices);
@@ -1124,7 +1360,7 @@ index 79e67a5..3c6af6b 100644
    rprof::mark(rprof::kPipeline);
    if (!p.pipeline && !p.pendingCompile) return;
    if (p.pendingCompile && !begin_exact_preparation()) resolve_pending_pipeline(p);
-@@ -2243,8 +2732,35 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2243,8 +2898,35 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
    if(vertex_window_stats_enabled()) report_vertex_window_stats();
    FeedbackStatsProbe feedbackProbe;
    auto* probe=feedback_stats_enabled()?&feedbackProbe:nullptr;
@@ -1162,7 +1398,7 @@ index 79e67a5..3c6af6b 100644
    // Texture uploads, feedback copies, and sampling transitions above may have
    // ended the previous pass. Reuse only its exact active attachment set.
    bool reusePass = R.rendering && R.passTracked && R.passColors == colors &&
-@@ -2328,7 +2844,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2328,7 +3010,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
      ri.pColorAttachments = attachments.data();
      ri.pDepthAttachment = depth ? &da : nullptr;
      ri.pStencilAttachment = depth && depth->fmt.stencil ? &da : nullptr;
@@ -1171,7 +1407,7 @@ index 79e67a5..3c6af6b 100644
      trace_pass(colors, ncolor, depth, depthSlice, width, height);
      record::vkCmdBeginRendering(cmd, &ri);
      ++R.renderPassCount;
-@@ -2474,6 +2990,12 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2474,6 +3156,12 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
      } else {
        const size_t bytes = size_t(count) * indexBytes;
        const auto* guest = static_cast<const uint8_t*>(mem::ptr(indexAddr));
@@ -1184,7 +1420,7 @@ index 79e67a5..3c6af6b 100644
        if (R.uploadReadsDirect) {
          nativeIndexSlice = snapshot(guest, bytes, 4);
          nativeIndexData = nativeIndexSlice.mapped;
-@@ -2556,12 +3078,24 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2556,12 +3244,24 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
          attributeEnd && stride && extent.valid && vertexExtent.valid &&
          windowEnd<=copied && windowBegin<windowEnd && windowBegin!=0;
      UploadSlice b;
@@ -1210,7 +1446,7 @@ index 79e67a5..3c6af6b 100644
      VkDeviceSize offset = b.offset;
      static const bool skipVertexBinds = [] {
        const char* e=std::getenv("WWHD_VK_SKIP_VERTEX_BINDS");
-@@ -2604,8 +3138,8 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2604,8 +3304,8 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
    }
    if(R.gpuPassTimestampsEnabled) gpu_count_render_draw();
    for (auto *color : colors)
@@ -1221,7 +1457,7 @@ index 79e67a5..3c6af6b 100644
    R.drawCount++;
    if (aoPrivateReplay) {
      aoPrivateFrame = R.frame;
-@@ -2618,6 +3152,9 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2618,6 +3318,9 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
        ~ReplayGuard() { aoPrivateReplay = false; }
      } guard;
      draw(r, prim, count, indexType, indexAddr, baseVertex, instances);
@@ -1251,8 +1487,82 @@ index b192f82..67e6de0 100644
  #endif
      if (saved("resScale", {"WWHD_RES_SCALE"})) gfxvk::set_res_scale((float)num("resScale"));
      if (saved("aoMode", {"WWHD_AO_MODE", "WWHD_NO_AO_QUIRK"})) gfxvk::set_ao_mode((int)num("aoMode"));
+diff --git a/runtime/src/gfx/vulkan/shaders.cpp b/runtime/src/gfx/vulkan/shaders.cpp
+index 6c95d71..072140b 100644
+--- a/runtime/src/gfx/vulkan/shaders.cpp
++++ b/runtime/src/gfx/vulkan/shaders.cpp
+@@ -295,6 +295,30 @@ struct ProgramUse {
+ };
+ std::unordered_map<uint64_t, ProgramUse> programUses;  // linkage key -> use
+ std::unordered_map<uint64_t, Shader*> variants;         // full key -> shader (may be shared)
++#ifdef __PROSPERO__
++// PlayStation 5: direct-mapped front caches ahead of the two maps, looked up twice a draw (both
++// stages): the maps' hashing was about 0.7 ms of a 15 ms pass. The maps' nodes are stable; both
++// front caches are emptied where the maps are cleared (clear_shader_cache).
++struct UseFront { uint64_t linkage = 0; ProgramUse* use = nullptr; };
++struct VariantFront { uint64_t key = 0; Shader* shader = nullptr; };
++std::array<UseFront, 2048> useFront{};
++std::array<VariantFront, 4096> variantFront{};
++inline ProgramUse& program_use(uint64_t linkage) {
++    UseFront& f = useFront[(linkage ^ (linkage >> 23)) & (useFront.size() - 1)];
++    if (f.use && f.linkage == linkage) return *f.use;
++    ProgramUse& use = programUses[linkage];
++    f.linkage = linkage; f.use = &use;
++    return use;
++}
++inline Shader* variant_lookup(uint64_t key) {
++    VariantFront& f = variantFront[(key ^ (key >> 19)) & (variantFront.size() - 1)];
++    if (f.shader && f.key == key) return f.shader;
++    auto it = variants.find(key);
++    if (it == variants.end()) return nullptr;
++    f.key = key; f.shader = it->second;
++    return it->second;
++}
++#endif
+ std::unordered_multimap<uint64_t, Shader*> shadersByOutput;
+ std::unordered_multimap<uint64_t, Shader*> shadersByModule;  // SPIR-V + resource mapping
+ // A pixel shader translated for the draw's vertex shader: the semantic ids that vertex shader
+@@ -974,15 +998,27 @@ Shader* translate(const uint32_t* regs, bool vertex, LatteFetchShader* fetch, ui
+     // Level 2: the units and exports this program uses; for a pixel shader, the inputs its
+     // vertex shader does not feed.
+     const PsLink link = vertex ? PsLink{} : ps_link(regs, linkedVs);
++#ifdef __PROSPERO__
++    auto& use = program_use(linkage);
++#else
+     auto& use = programUses[linkage];
++#endif
+     if (use.failed) return remember(use.failed);
+     if (use.known) {
+         const uint64_t key = variant_hash(regs, vertex, use, linkage, link);
++#ifdef __PROSPERO__
++        if (Shader* found = variant_lookup(key)) {
++            ++stats.variantHits;
++            verify_key(regs, vertex, fetch, fsKey, address, size, base, key, *found, link);
++            return remember(found);
++        }
++#else
+         if (auto it = variants.find(key); it != variants.end()) {
+             ++stats.variantHits;
+             verify_key(regs, vertex, fetch, fsKey, address, size, base, key, *it->second, link);
+             return remember(it->second);
+         }
++#endif
+     }
+     auto started = std::chrono::steady_clock::now();
+     struct CompileTimer {
+@@ -1283,6 +1319,10 @@ void clear_shader_cache() {
+     shaders.clear();
+     variants.clear();
+     programUses.clear();
++#ifdef __PROSPERO__
++    useFront.fill({});
++    variantFront.fill({});
++#endif
+     shadersByOutput.clear();
+     shadersByModule.clear();
+     verifiedKeys.clear();
 diff --git a/runtime/src/gfx/vulkan/surfaces.cpp b/runtime/src/gfx/vulkan/surfaces.cpp
-index 4ec5cfd..c198233 100644
+index 4ec5cfd..eabb406 100644
 --- a/runtime/src/gfx/vulkan/surfaces.cpp
 +++ b/runtime/src/gfx/vulkan/surfaces.cpp
 @@ -280,6 +280,7 @@ Surface* surface_from_depth_buffer(uint32_t addr, uint32_t* firstSlice, uint32_t
@@ -1336,7 +1646,7 @@ index 4ec5cfd..c198233 100644
  }
  void invalidate(uint32_t flags,uint32_t addr,uint32_t size) {
 +#ifdef __PROSPERO__
-+    ps5_vertex_invalidate(addr,size);
++    ps5_vertex_invalidate(flags,addr,size);
 +#endif
      buffer_cache_guest_invalidate(flags,addr,size);
      ++g_stat_invalidates;if(!(flags&2)||size>=0x10000000)return;

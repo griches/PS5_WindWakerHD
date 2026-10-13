@@ -58,11 +58,6 @@ ps5_startup(void)
    /* the renderer's reuse check of packed uniform blocks compares every block with the last one
     * and rarely hits here: off saves 0.4 ms of a 15 ms pass on the first island */
    set("WWHD_VK_REUSE_UNIFORM_SNAPSHOTS", "0", 0);
-   /* shadow distance: the farthest of the three shadow cascades is not drawn (bit 2 of the slice
-    * mask; gfx/vulkan/draw.cpp). A view across the first island then holds 60 fps instead of
-    * flapping between 30 and 58; what goes is the long shadow of a far cliff. WWHD_PS5_SHADOW_SKIP=0
-    * in env.txt draws every cascade. Gary chose this on 2026-10-13. */
-   set("WWHD_PS5_SHADOW_SKIP", "4", 0);
 
    FILE *file = fopen("/app0/env.txt", "r");
    if (file) {
