@@ -42,15 +42,14 @@ read in the console's log; nothing else is claimed.
 Known limits:
 
 - **60 fps is frame interpolation.** The game runs 30 steps a second and each
-  is drawn twice; the in-between frame reuses the step's shadow maps (below),
-  so it costs the render thread about half of a full pass. In the heaviest view
-  found on the first island a full pass is 16 ms and the two of a step average
-  10 ms a frame, which leaves the thread idle 6 to 7 ms. What moves casts a
-  shadow that is one frame (16 ms) old in the in-between frame. A view whose
-  full pass alone no longer fits would show 30 frames a second again (the
-  in-between frame is left out and the game keeps its speed). The game cannot
-  run ahead of the render thread to make room (tried: the render thread read a
-  surface the game had reused).
+  is drawn twice. In the heaviest view found on the first island the two
+  passes of a step average 13.7 ms of the render thread a frame, which leaves
+  it idle 3 ms. The far shadow cascade of the in-between frame is the step's
+  (below): what moves more than about 1,400 units from the camera casts a
+  shadow one frame (16 ms) old there. A view whose passes no longer fit shows
+  30 frames a second (the in-between frame is left out and the game keeps its
+  speed). The game cannot run ahead of the render thread to make room (tried:
+  the render thread read a surface the game had reused).
 - **Nothing past the first island has been measured.**
 - **Button symbols: the HUD and menus, in English.** The game prints a button's
   letter as text over a blank button, in the font of every other HUD label. The
@@ -253,22 +252,39 @@ What the console needed, each found on it and explained where it is handled:
   (`runtime/src/gx2/state_groups.h` says which registers end a run). 47 to 63%
   of draws continued on the beach, a 100-second verify run found no mismatch,
   and a pass went from 15 to 13 ms standing and from 11.5 to 10.5 ms walking.
-- **In-between frames on the step's shadow maps.** More than half of a pass's
-  draws fill the three shadow cascades, and at 60 fps they were filled twice a
-  step. On an in-between pass those draws and their clears are left out. The
-  game applies its shadows in one full-screen draw (the sun shadow mask), whose
-  uniform block holds for each cascade the matrix from view space to that
-  cascade's map, bias * light * inverse view; it fits the cascades to the
-  camera, so the in-between frame's own matrices belong to maps that were not
-  drawn (the first attempt used them: whole surfaces went dark whenever the
-  camera turned). The light matrices are taken from the shadow-map draws of the
-  step's own frame, checked against that frame's mask, and the in-between
-  frame's mask gets bias * that light * its own inverse view
-  (`runtime/src/gfx/vulkan/draw.cpp`, `ps5_mask_seen`). A step whose check
-  fails (a few in a hundred) draws its maps in the in-between frame as before.
+- **Shadow-map draws outside their cascade are left out.** The game draws
+  every object of the scene into each of its three shadow cascades (757 draws
+  a cascade in the view from the pier across the village), whatever the cascade
+  covers. A draw whose positions all lie outside the cascade's footprint in the
+  light's clip space cannot put anything into that map: 92% of the near
+  cascade's draws and 93% of the middle one's in that view, 2% of the far
+  one's. The test takes the box of the vertex buffer's positions through the
+  draw's world and light matrices, only for draws laid out as the game's shadow
+  pass was seen to lay them out (skinned models are never left out), not along
+  the light's depth, and with a margin (`runtime/src/gfx/vulkan/draw.cpp`,
+  `ps5_shadow_cull`). A frame with and without it shows the same shadows.
+  `WWHD_PS5_SHADOW_CULL=0` turns it off.
+- **In-between frames keep the step's far cascade.** The far cascade still
+  takes 750 draws, and at 60 fps it was filled twice a step. On an in-between
+  pass its draws and its clear are left out. The game applies its shadows in
+  one full-screen draw (the sun shadow mask), whose uniform block holds for
+  each cascade the matrix from view space to that cascade's map, bias * light
+  * inverse view; it fits the cascades to the camera, so the in-between frame's
+  own matrix belongs to a map that was not drawn (used with the kept map, whole
+  surfaces went dark whenever the camera turned: the first attempt). The light
+  matrix is taken from the shadow-map draws of the step's own frame, checked
+  against that frame's mask, and the in-between frame's mask gets bias * that
+  light * its own inverse view (`ps5_mask_seen`). A step whose check fails
+  draws the map as before. Keeping all three cascades was tried and held 60 fps
+  too, but Link's shadow, on the ground and on himself, flickered every frame
+  as he ran: he stands half a step further on in the in-between frame than in
+  the kept map (measured in recordings: consecutive frames differed more than
+  frames two apart; with the near two drawn afresh they do not).
+  `WWHD_PS5_HOLD_CASCADES` is the mask of cascades kept (default 4),
+  `WWHD_PS5_HOLD_SHADOWS=0` turns it off, `WWHD_PS5_HOLD_SHADOWS_LOG=1` logs
+  what both did; `WWHD_PS5_SHADOW_DUMP=<frame>` and
+  `WWHD_PS5_SHADOW_DRAWS=<frame>` write the uniforms and draws they rely on.
   The view across the village went from 33 fps to 60, standing and turning.
-  `WWHD_PS5_HOLD_SHADOWS=0` turns it off; `WWHD_PS5_HOLD_SHADOWS_LOG=1` logs
-  what it did; `WWHD_PS5_SHADOW_DUMP=<frame>` writes the uniforms it relies on.
 - **Vertex data is copied once for the passes that draw it.** The game sends
   about 190 invalidations a frame, nearly all for textures and render targets;
   only those for attribute buffers now end the reuse of a copied vertex range

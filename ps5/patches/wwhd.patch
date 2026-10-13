@@ -263,7 +263,7 @@ index 9b00d41..ffd0fdf 100644
  }
  static bool close_request(const SDL_Event& event) {
 diff --git a/runtime/src/gfx/vulkan/backend.h b/runtime/src/gfx/vulkan/backend.h
-index 518aad8..36d7ebf 100644
+index 518aad8..18f2d52 100644
 --- a/runtime/src/gfx/vulkan/backend.h
 +++ b/runtime/src/gfx/vulkan/backend.h
 @@ -205,6 +205,14 @@ void begin_pipeline_pending_frame();
@@ -276,7 +276,7 @@ index 518aad8..36d7ebf 100644
 +extern uint64_t ps5VertexInterval;
 +void ps5_vertex_invalidate(uint32_t flags, uint32_t addr, uint32_t size);
 +// draw.cpp: on an in-between pass, the shadow maps' depth target (which is not drawn again)
-+bool ps5_skip_shadow_target(uint32_t depthAddress);
++bool ps5_skip_shadow_target(uint32_t depthAddress, uint32_t slice);
 +#endif
  void reset_pipeline_lookup_cache();
  uint64_t draw_batch_submissions();
@@ -386,7 +386,7 @@ index 1f4631e..7191448 100644
    uint64_t frame_ = 0, lastSweep_ = 0, resident_ = 0;
    bool pressure_ = false;
 diff --git a/runtime/src/gfx/vulkan/draw.cpp b/runtime/src/gfx/vulkan/draw.cpp
-index 79e67a5..46c1746 100644
+index 79e67a5..7af4550 100644
 --- a/runtime/src/gfx/vulkan/draw.cpp
 +++ b/runtime/src/gfx/vulkan/draw.cpp
 @@ -10,6 +10,7 @@
@@ -570,7 +570,7 @@ index 79e67a5..46c1746 100644
    // compares the entry's CPU copy of the window, not the mapped slice, unless the entry was made with
    // direct reads (host-cached upload memory; vertex_snapshot_history.h)
    if(entry && entry->matches(address,reservation,begin,length)) {
-@@ -1697,10 +1828,288 @@ VkImageView feedback_view(Surface *source, const uint32_t *textureWords,
+@@ -1697,10 +1828,297 @@ VkImageView feedback_view(Surface *source, const uint32_t *textureWords,
    destroy_surface_image(&temporary); // Temporary snapshots remain fence-retired.
    return view;
  }
@@ -707,6 +707,15 @@ index 79e67a5..46c1746 100644
 +static bool ps5_hold_shadows_on() {
 +  static const bool on = [] { const char* e = std::getenv("WWHD_PS5_HOLD_SHADOWS"); return !e || std::strcmp(e, "0") != 0; }();
 +  return on;
++}
++// Which cascades an in-between frame keeps: WWHD_PS5_HOLD_CASCADES, a mask of slices (default 4:
++// the far one). The nearer two are drawn for every frame: what moves near the camera, Link first,
++// stands half a step further on in the in-between frame, and against a map of where it stood its
++// shadow on the ground and on itself flickered at 30 Hz (Gary, 2026-10-13, with all three kept).
++// They are cheap to draw since the draws outside a cascade are left out (ps5_shadow_cull).
++static uint32_t ps5_held_cascades() {
++  static const uint32_t mask = [] { const char* e = std::getenv("WWHD_PS5_HOLD_CASCADES"); return e && *e ? uint32_t(std::strtoul(e, nullptr, 0)) & 7u : 4u; }();
++  return mask;
 +}
 +// out = bias * light * inverseView (row-major, column vectors): the bias takes clip space to the
 +// shadow map's texture space (x/2 + 1/2, -y/2 + 1/2, z/2 + 1/2)
@@ -860,7 +869,7 @@ index 79e67a5..46c1746 100644
    StageResources out;
    auto &m = sh->mapping;
    // Descriptor info pointers must remain stable until this stage's one update.
-@@ -1759,7 +2168,15 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+@@ -1759,7 +2177,15 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
      UploadSlice cachedSlice;
      const bool cached = guestAddr && buffer_cache_enabled() &&
          cached_guest_range(guestAddr, uint32_t(size), rprof::kUpUbo, cachedSlice);
@@ -876,7 +885,7 @@ index 79e67a5..46c1746 100644
          : reuseUniforms
          ? uniformCache.get(R.device, R.submissionGeneration,
                             (sh->vertex ? 0 : 17) + logicalSlot, bytes, size,
-@@ -1840,6 +2257,32 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+@@ -1840,6 +2266,32 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
    rprof::mark(rprof::kUniforms);
    uint32_t texbase = sh->vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS
                                  : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS;
@@ -909,7 +918,7 @@ index 79e67a5..46c1746 100644
    for (int i = 0; i < sh->dec->textureUnitListCount; i++) {
      uint32_t unit = sh->dec->textureUnitList[i];
      if (unit >= LATTE_NUM_MAX_TEX_UNITS)
-@@ -1847,24 +2290,9 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+@@ -1847,24 +2299,9 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
      int binding = m.textureUnitToBindingPoint[unit];
      if (binding < 0)
        continue;
@@ -937,7 +946,7 @@ index 79e67a5..46c1746 100644
      VkImageView sampledView =
          aliases ? feedback_view(s, r + texbase + unit * 7, sh->vertex, unit, feedbackProbe)
                  : sampled_texture_view(s, r + texbase + unit * 7);
-@@ -1876,31 +2304,12 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+@@ -1876,31 +2313,12 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
                             : (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT),
                         VK_ACCESS_SHADER_READ_BIT);
@@ -975,7 +984,7 @@ index 79e67a5..46c1746 100644
    }
    rprof::mark(rprof::kTextures);
    if (m.uniformVarsBufferBindingPoint >= 0)
-@@ -1963,6 +2372,74 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+@@ -1963,6 +2381,74 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
    remember_descriptors(last, layout, out.set, writes.data(), writeCount);
    return out;
  }
@@ -1050,7 +1059,7 @@ index 79e67a5..46c1746 100644
  } // namespace
  void reset_feedback_images() { reset_feedback_scratch(); }
  UploadSlice vertex_window_smoke_snapshot(uint32_t binding,uint32_t address,
-@@ -1979,7 +2456,7 @@ void reset_ao_private_cache() { aoPrivateFrame = ~0ull; aoPrivateSource = 0; }
+@@ -1979,7 +2465,7 @@ void reset_ao_private_cache() { aoPrivateFrame = ~0ull; aoPrivateSource = 0; }
  void drain_pending_guest_pipelines() {
    for (auto& [key, value] : pipelines) resolve_pending_pipeline(value);
  }
@@ -1059,7 +1068,7 @@ index 79e67a5..46c1746 100644
  uint64_t draw_batch_submissions() { return drawBatchSubmissions; }
  // WWHD_VK_TRACE_PASSES=1 (issue #144): log each new render pass shape once, just before the driver
  // sees it, so a crash inside vkCmdBeginRendering names the last pass in the crash report's log lines
-@@ -2008,20 +2485,219 @@ static void trace_pass(const std::array<Surface *, 8> &colors, uint32_t ncolor,
+@@ -2008,20 +2494,400 @@ static void trace_pass(const std::array<Surface *, 8> &colors, uint32_t ncolor,
              (depth->fmt.stencil ? "/stencil" : "");
    LOG("[vulkan pass] %ux%u, %u colour attachment(s)%s", width, height, ncolor, text.c_str());
  }
@@ -1091,6 +1100,127 @@ index 79e67a5..46c1746 100644
 +  ps5LightCaptured |= 1u << slice;
 +}
 +static bool ps5_is_shadow_mask(const uint32_t* r);
++// PlayStation 5: shadow-map draws outside their cascade are left out.
++//
++// The game draws every object of the scene into each of the three cascades (757 draws a cascade in
++// the view from the first island's pier across the village), whatever part of the scene the
++// cascade covers: the near one a few metres around the camera. A draw whose positions all lie
++// outside the cascade's footprint in the light's clip space (x or y beyond w) cannot put anything
++// into that map. In that view 92% of the near cascade's draws and 93% of the middle one's are such
++// (measured with WWHD_PS5_SHADOW_DRAWS and the matrices below).
++//
++// What is tested is the box of the vertex buffer's positions, in the object's space, taken through
++// the draw's world matrix and light matrix. This is done only where the draw looks as those the
++// game's shadow pass was seen to issue: positions as attribute 0, three big-endian floats; uniform
++// block 1 of 64 or 256 bytes whose first three rows are the world matrix (skinned models have a
++// larger block of bone matrices: never left out); uniform block 2 of 512 bytes with the light
++// matrix in rows 3-6. The depth axis is not tested (a caster may stand between the light and the
++// cascade), a corner behind the light's plane keeps the draw, and there is a margin of a twentieth.
++// A buffer that is written (page write tracking) gets its box again; one that keeps changing is
++// never left out. WWHD_PS5_SHADOW_CULL=0 turns this off.
++struct Ps5Box {
++  uint32_t addr = 0, size = 0, stride = 0, offset = 0;
++  uint64_t stamp = 0, seq = 0, madeFrame = 0;
++  float lo[3], hi[3];
++  uint8_t churn = 0;
++  bool valid = false, dynamic = false;
++};
++static std::array<Ps5Box, 4096> ps5Boxes;
++static uint64_t ps5Culled = 0, ps5CullTested = 0, ps5CullUntestable = 0, ps5BoxesMade = 0;
++static bool ps5_shadow_cull_on() {
++  static const bool on = [] { const char* e = std::getenv("WWHD_PS5_SHADOW_CULL"); return !e || std::strcmp(e, "0") != 0; }();
++  return on;
++}
++static const Ps5Box* ps5_position_box(uint32_t addr, uint32_t size, uint32_t stride, uint32_t offset) {
++  uint64_t h = (uint64_t(addr) * 0x9E3779B97F4A7C15ull) ^ (uint64_t(size) << 17) ^ (uint64_t(stride) << 7) ^ offset;
++  Ps5Box& b = ps5Boxes[size_t((h ^ (h >> 29)) * 0xBF58476D1CE4E5B9ull >> 52)];
++  const bool same = b.valid && b.addr == addr && b.size == size && b.stride == stride && b.offset == offset;
++  if (same) {
++    if (b.dynamic) return nullptr;
++    const uint64_t seq = wwatch::write_seq();
++    if (b.seq == seq) return &b;
++    if (!wwatch::changed_since(addr, size, b.stamp)) { b.seq = seq; return &b; }
++    if (R.frame - b.madeFrame < 600 && ++b.churn >= 3) { b.dynamic = true; return nullptr; }  // rewritten again and again
++  } else {
++    b = {};
++    b.addr = addr; b.size = size; b.stride = stride; b.offset = offset;
++  }
++  b.seq = wwatch::write_seq();
++  b.stamp = wwatch::arm(addr, size);  // before the bytes are read
++  b.madeFrame = R.frame;
++  float lo[3] = {3e38f, 3e38f, 3e38f}, hi[3] = {-3e38f, -3e38f, -3e38f};
++  const uint8_t* base = static_cast<const uint8_t*>(mem::ptr(addr)) + offset;
++  const uint32_t count = (size - offset - 12) / stride + 1;
++  for (uint32_t v = 0; v < count; ++v)
++    for (int c = 0; c < 3; ++c) {
++      uint32_t w;
++      std::memcpy(&w, base + size_t(v) * stride + c * 4, 4);
++      w = __builtin_bswap32(w);
++      float f;
++      std::memcpy(&f, &w, 4);
++      if (!(f >= -1e9f && f <= 1e9f)) { b.valid = true; b.dynamic = true; return nullptr; }  // not positions
++      lo[c] = std::min(lo[c], f);
++      hi[c] = std::max(hi[c], f);
++    }
++  std::memcpy(b.lo, lo, sizeof lo);
++  std::memcpy(b.hi, hi, sizeof hi);
++  b.valid = true;
++  ++ps5BoxesMade;
++  return &b;
++}
++// true: this draw into a shadow-map slice lies outside the slice's cascade
++static bool ps5_shadow_cull(const uint32_t* r) {
++  const uint32_t worldAddr = r[mmSQ_VTX_UNIFORM_BLOCK_START + 7], worldSize = r[mmSQ_VTX_UNIFORM_BLOCK_START + 8] + 1;
++  const uint32_t lightAddr = r[mmSQ_VTX_UNIFORM_BLOCK_START + 14], lightSize = r[mmSQ_VTX_UNIFORM_BLOCK_START + 15] + 1;
++  if (!worldAddr || !lightAddr || lightSize != 512 || (worldSize != 64 && worldSize != 256)) { ++ps5CullUntestable; return false; }
++  uint64_t fsKey = 0;
++  auto* fs = vk::get_fetch_shader(r, &fsKey, R.frame);
++  if (!fs) { ++ps5CullUntestable; return false; }
++  const Ps5Box* box = nullptr;
++  for (auto& g : fs->bufferGroups) {
++    for (int j = 0; j < g.attribCount && !box; ++j) {
++      const auto& a = g.attrib[j];
++      if (a.semanticId != 0) continue;
++      const uint32_t addr = r[mmSQ_VTX_ATTRIBUTE_BLOCK_START + g.attributeBufferIndex * 7];
++      const uint32_t size = r[mmSQ_VTX_ATTRIBUTE_BLOCK_START + g.attributeBufferIndex * 7 + 1] + 1;
++      const uint32_t stride = (r[mmSQ_VTX_ATTRIBUTE_BLOCK_START + g.attributeBufferIndex * 7 + 2] >> 11) & 0xFFFF;
++      if (unsigned(a.format) != 0x30 || unsigned(a.endianSwap) != 2 || a.fetchType != LatteConst::VertexFetchType2::VERTEX_DATA ||
++          !addr || stride < 12 || size < a.offset + 12 || size > (8u << 20) || uint64_t(addr) + size > 0x100000000ull) {
++        ++ps5CullUntestable;
++        return false;
++      }
++      box = ps5_position_box(addr, size, stride, a.offset);
++      if (!box) { ++ps5CullUntestable; return false; }
++    }
++    if (box) break;
++  }
++  if (!box) { ++ps5CullUntestable; return false; }
++  float world[16], light[16];
++  std::memcpy(world, mem::ptr(worldAddr), sizeof world);
++  std::memcpy(light, mem::ptr(lightAddr + 48), sizeof light);
++  // the block's fourth row is empty or (0, 0, 0, 1) where its first three are a world matrix
++  if (world[12] != 0 || world[13] != 0 || world[14] != 0 || (world[15] != 0 && world[15] != 1)) { ++ps5CullUntestable; return false; }
++  ++ps5CullTested;
++  // light * world, as rows over (x, y, z, 1)
++  float m[16];
++  for (int row = 0; row < 4; ++row)
++    for (int col = 0; col < 4; ++col)
++      m[row * 4 + col] = light[row * 4] * world[col] + light[row * 4 + 1] * world[4 + col] + light[row * 4 + 2] * world[8 + col] +
++                         (col == 3 ? light[row * 4 + 3] : 0.0f);
++  bool left = true, right = true, below = true, above = true;
++  for (int corner = 0; corner < 8; ++corner) {
++    const float x = corner & 1 ? box->hi[0] : box->lo[0], y = corner & 2 ? box->hi[1] : box->lo[1], z = corner & 4 ? box->hi[2] : box->lo[2];
++    const float cx = m[0] * x + m[1] * y + m[2] * z + m[3], cy = m[4] * x + m[5] * y + m[6] * z + m[7];
++    const float cw = m[12] * x + m[13] * y + m[14] * z + m[15];
++    if (!(cw > 1e-6f)) return false;  // behind the light's plane (or not a number): keep
++    const float edge = cw * 1.05f;
++    left = left && cx < -edge;
++    right = right && cx > edge;
++    below = below && cy < -edge;
++    above = above && cy > edge;
++  }
++  return left || right || below || above;
++}
 +// the sun shadow mask's draw: note its block; in a step's own frame, check the captured matrices
 +static void ps5_mask_seen(const uint32_t* r) {
 +  const uint32_t addr = r[mmSQ_PS_UNIFORM_BLOCK_START + 7], size = r[mmSQ_PS_UNIFORM_BLOCK_START + 8] + 1;
@@ -1103,8 +1233,9 @@ index 79e67a5..46c1746 100644
 +    if (ps5ShadowsVerified && ps5MaskBlock) {
 +      float block[kPs5MaskCascade0 + 48];
 +      std::memcpy(block, mem::ptr(addr), sizeof block);
-+      for (int k = 0; k < 3; ++k)
-+        ps5_mask_matrix(ps5LightVP[k], block + kPs5MaskInverseView, block + kPs5MaskCascade0 + 16 * k);
++      for (int k = 0; k < 3; ++k)  // (a cascade drawn for this frame keeps the game's own matrix)
++        if ((ps5_held_cascades() >> k) & 1)
++          ps5_mask_matrix(ps5LightVP[k], block + kPs5MaskInverseView, block + kPs5MaskCascade0 + 16 * k);
 +      wwatch::HostWrite writing(addr + kPs5MaskCascade0 * 4, 48 * 4);
 +      std::memcpy(mem::ptr(addr + kPs5MaskCascade0 * 4), block + kPs5MaskCascade0, 48 * 4);
 +      ++ps5MaskPatched;
@@ -1141,16 +1272,21 @@ index 79e67a5..46c1746 100644
 +        (unsigned long long)std::exchange(ps5MaskPatched, 0), (unsigned long long)std::exchange(ps5MaskSeen, 0),
 +        (unsigned long long)std::exchange(ps5MaskRejected, 0), (unsigned long long)std::exchange(ps5RejectNoBlock, 0),
 +        (unsigned long long)std::exchange(ps5RejectCaptured, 0), (unsigned long long)std::exchange(ps5ShadowDrawsSeen, 0), ps5ShadowDepth);
++  if (hold && passes % every == 0)
++    LOG("[vulkan] shadow-map draws outside their cascade: %llu left out of %llu tested, %llu not testable; %llu position boxes made",
++        (unsigned long long)std::exchange(ps5Culled, 0), (unsigned long long)std::exchange(ps5CullTested, 0),
++        (unsigned long long)std::exchange(ps5CullUntestable, 0), (unsigned long long)std::exchange(ps5BoxesMade, 0));
 +  if (!hold) {  // a step's own frame begins: its cascades are captured and verified afresh
 +    ps5LightCaptured = 0;
 +    ps5ShadowsVerified = false;
 +  }
 +  ps5HoldPass = hold;
 +}
-+bool ps5_skip_shadow_target(uint32_t depthAddress) {
++bool ps5_skip_shadow_target(uint32_t depthAddress, uint32_t slice) {
 +  // Only after the step's own frame showed that its mask is bias * light * inverse view for the
 +  // light matrices captured from its shadow-map draws: otherwise the maps are drawn as usual.
-+  return ps5_hold_shadows_on() && ps5HoldPass && ps5ShadowsVerified && depthAddress && depthAddress == ps5ShadowDepth;
++  return ps5_hold_shadows_on() && ps5HoldPass && ps5ShadowsVerified && depthAddress && depthAddress == ps5ShadowDepth &&
++         slice < 3 && ((ps5_held_cascades() >> slice) & 1);
 +}
 +#endif
 +
@@ -1204,6 +1340,55 @@ index 79e67a5..46c1746 100644
 +  fflush(out);
 +}
 +#endif
++#ifdef __PROSPERO__
++// debug: WWHD_PS5_SHADOW_DRAWS=<frame> writes every shadow-map draw of that frame and the next to
++// /app0/userdata/shadowdraws.txt: its slice, vertex layout, uniform blocks' sizes, world matrix,
++// light matrix and the bounding box of its positions (read as three big-endian floats)
++static void ps5_shadow_draw_dump(const uint32_t* r, uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr, uint32_t baseVertex) {
++  static const long first = [] { const char* e = std::getenv("WWHD_PS5_SHADOW_DRAWS"); return e && *e ? std::atol(e) : -1L; }();
++  if (first < 0 || long(R.frame) < first || long(R.frame) >= first + 2) return;
++  if (!(r[gx2::kDepthSlicesReg] > 1 && r[mmDB_DEPTH_BASE] && r[mmDB_DEPTH_BASE] == ps5ShadowDepth) || ps5_is_shadow_mask(r)) return;
++  static FILE* out = fopen("/app0/userdata/shadowdraws.txt", "w");
++  if (!out) return;
++  uint64_t fsKey = 0;
++  auto* fs = vk::get_fetch_shader(r, &fsKey, R.frame);
++  fprintf(out, "D frame %llu hold %d slice %u vs %08X prim %u count %u itype %u iaddr %08X base %u fs %016llX\n", (unsigned long long)R.frame,
++          int(ps5HoldPass), r[mmDB_DEPTH_VIEW] & 0x7FF, r[mmSQ_PGM_START_VS] << 8, prim, count, indexType, indexAddr, baseVertex, (unsigned long long)fsKey);
++  for (uint32_t i = 0; i < 6; ++i) {
++    const uint32_t addr = r[mmSQ_VTX_UNIFORM_BLOCK_START + i * 7], size = r[mmSQ_VTX_UNIFORM_BLOCK_START + i * 7 + 1] + 1;
++    if (!addr || size > 0x10000) continue;
++    fprintf(out, "U %u %08X %u", i, addr, size);
++    const uint32_t n = i == 1 ? 16 : i == 2 ? 28 : 0;
++    for (uint32_t k = 0; k < n && k * 4 < size; ++k) { float f; std::memcpy(&f, mem::ptr(addr + k * 4), 4); fprintf(out, " %.9g", f); }
++    fputc('\n', out);
++  }
++  if (!fs) return;
++  for (auto& g : fs->bufferGroups) {
++    const uint32_t addr = r[mmSQ_VTX_ATTRIBUTE_BLOCK_START + g.attributeBufferIndex * 7];
++    const uint32_t size = r[mmSQ_VTX_ATTRIBUTE_BLOCK_START + g.attributeBufferIndex * 7 + 1] + 1;
++    const uint32_t stride = (r[mmSQ_VTX_ATTRIBUTE_BLOCK_START + g.attributeBufferIndex * 7 + 2] >> 11) & 0xFFFF;
++    fprintf(out, "G buffer %u addr %08X size %u stride %u attribs %d\n", g.attributeBufferIndex, addr, size, stride, int(g.attribCount));
++    for (int j = 0; j < g.attribCount; ++j) {
++      const auto& a = g.attrib[j];
++      fprintf(out, "  A semantic %u format %u offset %u endian %u fetch %u signed %u nfa %u\n", unsigned(a.semanticId), unsigned(a.format), a.offset,
++              unsigned(a.endianSwap), unsigned(a.fetchType), unsigned(a.isSigned), unsigned(a.nfa));
++      if (a.semanticId == 0 && stride >= 12 && addr && size >= a.offset + 12 && size < (64u << 20)) {
++        float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
++        const uint32_t n = (size - a.offset - 12) / stride + 1;
++        for (uint32_t v = 0; v < n; ++v)
++          for (int c = 0; c < 3; ++c) {
++            uint32_t w; std::memcpy(&w, mem::ptr(addr + a.offset + v * stride + c * 4), 4);
++            w = __builtin_bswap32(w);
++            float f; std::memcpy(&f, &w, 4);
++            lo[c] = std::min(lo[c], f); hi[c] = std::max(hi[c], f);
++          }
++        fprintf(out, "  B vertices %u box %.9g %.9g %.9g  %.9g %.9g %.9g\n", n, lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]);
++      }
++    }
++  }
++  fflush(out);
++}
++#endif
  void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
            uint32_t indexAddr, uint32_t baseVertex, uint32_t instances) {
 +  const uint32_t dirtyGroups = gx2::take_dirty_groups();  // register groups changed since the previous draw
@@ -1217,15 +1402,20 @@ index 79e67a5..46c1746 100644
 +    if (ps5_hold_shadows_on()) ps5_mask_seen(r);
 +  } else if (r[gx2::kDepthSlicesReg] > 1 && r[mmDB_DEPTH_BASE] && r[mmDB_DEPTH_BASE] == ps5ShadowDepth) {
 +    ++ps5ShadowDrawsSeen;
-+    if (ps5_skip_shadow_target(r[mmDB_DEPTH_BASE])) {
++    if (ps5_skip_shadow_target(r[mmDB_DEPTH_BASE], r[mmDB_DEPTH_VIEW] & 0x7FF)) {
 +      ++ps5ShadowSkipped;
 +      return;
 +    }
 +    if (!ps5HoldPass && ps5_hold_shadows_on()) ps5_capture_light(r);
++    if (ps5_shadow_cull_on() && ps5_shadow_cull(r)) {
++      ++ps5Culled;
++      return;
++    }
 +  }
 +#endif
 +#ifdef __PROSPERO__
 +  ps5_shadow_dump(r);  // debug: WWHD_PS5_SHADOW_DUMP=<first frame>
++  ps5_shadow_draw_dump(r, prim, count, indexType, indexAddr, baseVertex);  // debug: WWHD_PS5_SHADOW_DRAWS=<frame>
 +#endif
    ((uint32_t *)r)[REGADDR::VGT_PRIMITIVE_TYPE] = prim;
 +  // continued-draw fast path (see fastpath_config); the AO replay draw stays outside of it
@@ -1285,7 +1475,7 @@ index 79e67a5..46c1746 100644
    rprof::mark(rprof::kShader);
    if (!vs || !vs->ready() || !ps || !ps->ready())
      exception_report::raise("Vulkan shader translation failed: " +
-@@ -2189,52 +2865,31 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2189,52 +3055,31 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
      }
    }
    rprof::mark(rprof::kIndices);
@@ -1360,7 +1550,7 @@ index 79e67a5..46c1746 100644
    rprof::mark(rprof::kPipeline);
    if (!p.pipeline && !p.pendingCompile) return;
    if (p.pendingCompile && !begin_exact_preparation()) resolve_pending_pipeline(p);
-@@ -2243,8 +2898,35 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2243,8 +3088,35 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
    if(vertex_window_stats_enabled()) report_vertex_window_stats();
    FeedbackStatsProbe feedbackProbe;
    auto* probe=feedback_stats_enabled()?&feedbackProbe:nullptr;
@@ -1398,7 +1588,7 @@ index 79e67a5..46c1746 100644
    // Texture uploads, feedback copies, and sampling transitions above may have
    // ended the previous pass. Reuse only its exact active attachment set.
    bool reusePass = R.rendering && R.passTracked && R.passColors == colors &&
-@@ -2328,7 +3010,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2328,7 +3200,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
      ri.pColorAttachments = attachments.data();
      ri.pDepthAttachment = depth ? &da : nullptr;
      ri.pStencilAttachment = depth && depth->fmt.stencil ? &da : nullptr;
@@ -1407,7 +1597,7 @@ index 79e67a5..46c1746 100644
      trace_pass(colors, ncolor, depth, depthSlice, width, height);
      record::vkCmdBeginRendering(cmd, &ri);
      ++R.renderPassCount;
-@@ -2474,6 +3156,12 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2474,6 +3346,12 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
      } else {
        const size_t bytes = size_t(count) * indexBytes;
        const auto* guest = static_cast<const uint8_t*>(mem::ptr(indexAddr));
@@ -1420,7 +1610,7 @@ index 79e67a5..46c1746 100644
        if (R.uploadReadsDirect) {
          nativeIndexSlice = snapshot(guest, bytes, 4);
          nativeIndexData = nativeIndexSlice.mapped;
-@@ -2556,12 +3244,24 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2556,12 +3434,24 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
          attributeEnd && stride && extent.valid && vertexExtent.valid &&
          windowEnd<=copied && windowBegin<windowEnd && windowBegin!=0;
      UploadSlice b;
@@ -1446,7 +1636,7 @@ index 79e67a5..46c1746 100644
      VkDeviceSize offset = b.offset;
      static const bool skipVertexBinds = [] {
        const char* e=std::getenv("WWHD_VK_SKIP_VERTEX_BINDS");
-@@ -2604,8 +3304,8 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2604,8 +3494,8 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
    }
    if(R.gpuPassTimestampsEnabled) gpu_count_render_draw();
    for (auto *color : colors)
@@ -1457,7 +1647,7 @@ index 79e67a5..46c1746 100644
    R.drawCount++;
    if (aoPrivateReplay) {
      aoPrivateFrame = R.frame;
-@@ -2618,6 +3318,9 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2618,6 +3508,9 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
        ~ReplayGuard() { aoPrivateReplay = false; }
      } guard;
      draw(r, prim, count, indexType, indexAddr, baseVertex, instances);
@@ -1562,7 +1752,7 @@ index 6c95d71..072140b 100644
      shadersByModule.clear();
      verifiedKeys.clear();
 diff --git a/runtime/src/gfx/vulkan/surfaces.cpp b/runtime/src/gfx/vulkan/surfaces.cpp
-index 4ec5cfd..eabb406 100644
+index 4ec5cfd..88769b5 100644
 --- a/runtime/src/gfx/vulkan/surfaces.cpp
 +++ b/runtime/src/gfx/vulkan/surfaces.cpp
 @@ -280,6 +280,7 @@ Surface* surface_from_depth_buffer(uint32_t addr, uint32_t* firstSlice, uint32_t
@@ -1625,17 +1815,34 @@ index 4ec5cfd..eabb406 100644
  }
  void clear_color(const uint32_t*,uint32_t cb,const float rgba[4]) {
      uint32_t first,num;auto* s=surface_from_color_buffer(cb,&first,&num);if(!s)return;
-@@ -1216,6 +1230,9 @@ void clear_color(const uint32_t*,uint32_t cb,const float rgba[4]) {
+@@ -1216,6 +1230,26 @@ void clear_color(const uint32_t*,uint32_t cb,const float rgba[4]) {
  }
  void clear_depth_stencil(const uint32_t*,uint32_t db,float depth,uint32_t stencil,uint32_t flags) {
      uint32_t first,num;auto* s=surface_from_depth_buffer(db,&first,&num);if(!s)return;
 +#ifdef __PROSPERO__
-+    if(ps5_skip_shadow_target(s->addr))return;  // an in-between pass keeps the shadow maps (draw.cpp)
++    // an in-between pass keeps some of the shadow maps (draw.cpp): their slices are not cleared
++    {
++        bool held=false;for(uint32_t i=0;i<num;++i)held|=ps5_skip_shadow_target(s->addr,first+i);
++        if(held) {
++            VkImageAspectFlags a=0;if(flags&1)a|=VK_IMAGE_ASPECT_DEPTH_BIT;if((flags&2)&&s->fmt.stencil)a|=VK_IMAGE_ASPECT_STENCIL_BIT;
++            if(!a)return;
++            bool any=false;for(uint32_t i=0;i<num;++i)any|=!ps5_skip_shadow_target(s->addr,first+i);
++            if(!any)return;
++            end_encoder();transition_image(s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
++            VkClearDepthStencilValue v{depth,stencil};
++            for(uint32_t i=0;i<num;++i) {
++                if(ps5_skip_shadow_target(s->addr,first+i))continue;
++                VkImageSubresourceRange one{a,0,1,first+i,1};
++                record::vkCmdClearDepthStencilImage(command_buffer(),s->image,s->layout,&v,1,&one);
++            }
++            mark_gpu_written(s);return;
++        }
++    }
 +#endif
      VkImageAspectFlags aspects=0;if(flags&1)aspects|=VK_IMAGE_ASPECT_DEPTH_BIT;if((flags&2)&&s->fmt.stencil)aspects|=VK_IMAGE_ASPECT_STENCIL_BIT;
      if(!aspects)return;
      end_encoder();transition_image(s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
-@@ -1388,11 +1405,15 @@ void copy_surface_impl(uint32_t srcAddr,uint32_t srcMip,uint32_t srcSlice,uint32
+@@ -1388,11 +1422,15 @@ void copy_surface_impl(uint32_t srcAddr,uint32_t srcMip,uint32_t srcSlice,uint32
          memcpy(mem::ptr(dbase+offset),rows.data()+(size_t(y)*bw+x)*sf.bytesPerBlock,sf.bytesPerBlock);
      }
      for(auto& [address,image]:R.surfaces)if(address==dbase){image->gpuWritten=false;image->dirty=true;image->lastCheckedFrame=~0ull;}
@@ -1651,7 +1858,7 @@ index 4ec5cfd..eabb406 100644
      buffer_cache_guest_invalidate(flags,addr,size);
      ++g_stat_invalidates;if(!(flags&2)||size>=0x10000000)return;
      uint64_t end=uint64_t(addr)+size;
-@@ -1438,6 +1459,7 @@ void invalidate(uint32_t flags,uint32_t addr,uint32_t size) {
+@@ -1438,6 +1476,7 @@ void invalidate(uint32_t flags,uint32_t addr,uint32_t size) {
  }
  void ss_reset_surfaces() {
      R.mainDepthAddr = 0;
