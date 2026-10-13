@@ -256,6 +256,15 @@ What the console needed, each found on it and explained where it is handled:
   (`runtime/src/gx2/state_groups.h` says which registers end a run). 47 to 63%
   of draws continued on the beach, a 100-second verify run found no mismatch,
   and a pass went from 15 to 13 ms standing and from 11.5 to 10.5 ms walking.
+- **Shadow distance.** The game draws every object in view into three shadow
+  cascades, a third of the island's draws each. The farthest cascade is left
+  out (its clear stays, so it casts nothing): in a view across the island that
+  took a pass from 15.3 to 13.7 ms, from flapping between 30 and 58 fps to a
+  steady 60; what goes is the long shadow of a distant cliff, and Link's own
+  shadow and everything near stay. `WWHD_PS5_SHADOW_SKIP=0` in `env.txt`
+  draws all three (the value is a mask of slices to leave out). Also, the
+  renderer's reuse check of packed uniform blocks is off here (it rarely hit
+  and cost 0.4 ms a pass; `WWHD_VK_REUSE_UNIFORM_SNAPSHOTS=1` turns it on).
 - **The game's code is built with `-fwrapv`** (upstream PR #172): PowerPC
   integer arithmetic wraps, and the compiler now guarantees the same for the
   recompiled code instead of relying on it never overflowing.

@@ -316,7 +316,7 @@ index d51fbac..1bb1743 100644
          b.write_back = gfxvk::write_back_linear_targets;
          b.ss_reset = [] {
 diff --git a/runtime/src/gfx/vulkan/draw.cpp b/runtime/src/gfx/vulkan/draw.cpp
-index 79e67a5..a6c9b22 100644
+index 79e67a5..3c6af6b 100644
 --- a/runtime/src/gfx/vulkan/draw.cpp
 +++ b/runtime/src/gfx/vulkan/draw.cpp
 @@ -10,6 +10,7 @@
@@ -488,7 +488,7 @@ index 79e67a5..a6c9b22 100644
    // compares the entry's CPU copy of the window, not the mapped slice, unless the entry was made with
    // direct reads (host-cached upload memory; vertex_snapshot_history.h)
    if(entry && entry->matches(address,reservation,begin,length)) {
-@@ -1697,10 +1816,256 @@ VkImageView feedback_view(Surface *source, const uint32_t *textureWords,
+@@ -1697,10 +1816,257 @@ VkImageView feedback_view(Surface *source, const uint32_t *textureWords,
    destroy_surface_image(&temporary); // Temporary snapshots remain fence-retired.
    return view;
  }
@@ -614,6 +614,7 @@ index 79e67a5..a6c9b22 100644
 +#ifdef __PROSPERO__
 +static bool ps5HoldPass = false;      // the in-between pass's shadow maps are the step's (below)
 +static uint32_t ps5ShadowDepth = 0;
++static uint64_t ps5ShadowSkipped = 0;
 +#endif
 +bool resolve_targets(const uint32_t* r, vk::Shader* ps, DrawTargets& t) {
 +  t = {};
@@ -746,7 +747,7 @@ index 79e67a5..a6c9b22 100644
    StageResources out;
    auto &m = sh->mapping;
    // Descriptor info pointers must remain stable until this stage's one update.
-@@ -1759,7 +2124,15 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+@@ -1759,7 +2125,15 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
      UploadSlice cachedSlice;
      const bool cached = guestAddr && buffer_cache_enabled() &&
          cached_guest_range(guestAddr, uint32_t(size), rprof::kUpUbo, cachedSlice);
@@ -762,7 +763,7 @@ index 79e67a5..a6c9b22 100644
          : reuseUniforms
          ? uniformCache.get(R.device, R.submissionGeneration,
                             (sh->vertex ? 0 : 17) + logicalSlot, bytes, size,
-@@ -1840,6 +2213,32 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+@@ -1840,6 +2214,32 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
    rprof::mark(rprof::kUniforms);
    uint32_t texbase = sh->vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS
                                  : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS;
@@ -795,7 +796,7 @@ index 79e67a5..a6c9b22 100644
    for (int i = 0; i < sh->dec->textureUnitListCount; i++) {
      uint32_t unit = sh->dec->textureUnitList[i];
      if (unit >= LATTE_NUM_MAX_TEX_UNITS)
-@@ -1847,24 +2246,9 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+@@ -1847,24 +2247,9 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
      int binding = m.textureUnitToBindingPoint[unit];
      if (binding < 0)
        continue;
@@ -823,7 +824,7 @@ index 79e67a5..a6c9b22 100644
      VkImageView sampledView =
          aliases ? feedback_view(s, r + texbase + unit * 7, sh->vertex, unit, feedbackProbe)
                  : sampled_texture_view(s, r + texbase + unit * 7);
-@@ -1876,31 +2260,12 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+@@ -1876,31 +2261,12 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
                             : (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT),
                         VK_ACCESS_SHADER_READ_BIT);
@@ -861,7 +862,7 @@ index 79e67a5..a6c9b22 100644
    }
    rprof::mark(rprof::kTextures);
    if (m.uniformVarsBufferBindingPoint >= 0)
-@@ -1963,6 +2328,74 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+@@ -1963,6 +2329,74 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
    remember_descriptors(last, layout, out.set, writes.data(), writeCount);
    return out;
  }
@@ -936,7 +937,7 @@ index 79e67a5..a6c9b22 100644
  } // namespace
  void reset_feedback_images() { reset_feedback_scratch(); }
  UploadSlice vertex_window_smoke_snapshot(uint32_t binding,uint32_t address,
-@@ -1979,7 +2412,7 @@ void reset_ao_private_cache() { aoPrivateFrame = ~0ull; aoPrivateSource = 0; }
+@@ -1979,7 +2413,7 @@ void reset_ao_private_cache() { aoPrivateFrame = ~0ull; aoPrivateSource = 0; }
  void drain_pending_guest_pipelines() {
    for (auto& [key, value] : pipelines) resolve_pending_pipeline(value);
  }
@@ -945,7 +946,7 @@ index 79e67a5..a6c9b22 100644
  uint64_t draw_batch_submissions() { return drawBatchSubmissions; }
  // WWHD_VK_TRACE_PASSES=1 (issue #144): log each new render pass shape once, just before the driver
  // sees it, so a crash inside vkCmdBeginRendering names the last pass in the crash report's log lines
-@@ -2008,20 +2441,97 @@ static void trace_pass(const std::array<Surface *, 8> &colors, uint32_t ncolor,
+@@ -2008,20 +2442,96 @@ static void trace_pass(const std::array<Surface *, 8> &colors, uint32_t ncolor,
              (depth->fmt.stencil ? "/stencil" : "");
    LOG("[vulkan pass] %ux%u, %u colour attachment(s)%s", width, height, ncolor, text.c_str());
  }
@@ -962,7 +963,6 @@ index 79e67a5..a6c9b22 100644
 +// left out: the maps of the step's first pass stay, 16 ms old for what moved. The array is the one
 +// the last full pass drew into without a colour target (ps5ShadowDepth); which kind of pass this
 +// is comes from the swap before it (gx2_core.cpp). WWHD_PS5_HOLD_SHADOWS=1 turns this on.
-+static uint64_t ps5ShadowSkipped = 0;
 +void ps5_set_hold_pass(bool hold) {
 +  static uint64_t passes;
 +  if (hold && ++passes % 3000 == 0 && preparation_stats_enabled())  // (WWHD_VK_STATS)
@@ -1049,7 +1049,7 @@ index 79e67a5..a6c9b22 100644
    rprof::mark(rprof::kShader);
    if (!vs || !vs->ready() || !ps || !ps->ready())
      exception_report::raise("Vulkan shader translation failed: " +
-@@ -2189,52 +2699,17 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2189,52 +2699,31 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
      }
    }
    rprof::mark(rprof::kIndices);
@@ -1097,21 +1097,34 @@ index 79e67a5..a6c9b22 100644
 -    if (c && (c->extent.width != width || c->extent.height != height)) {
 -      if (aoPrivateReplay) c = nullptr;
 -      else exception_report::raise("mismatched Vulkan attachments");
--    }
--  if (depth && (depth->extent.width < width || depth->extent.height < height))
--    depth = nullptr;
 +  auto& colors = targets.colors;
 +  auto& slices = targets.slices;
 +  Surface* depth = targets.depth;
 +  const uint32_t depthSlice = targets.depthSlice, width = targets.width, height = targets.height;
 +  const float sx = targets.sx, sy = targets.sy;
++#ifdef __PROSPERO__
++  // PlayStation 5: WWHD_PS5_SHADOW_SKIP=mask leaves out the draws into those slices of the
++  // shadow-map array (bit n: slice n; the cascades: three 1024x1024 depth slices, drawn with no
++  // colour target; their clears stay, so a left-out cascade casts no shadow). On the first island
++  // each cascade is a third of the shadow draws; leaving out the farthest keeps shadows near the
++  // camera and drops the distant ones, a "shadow distance" setting. Unset: every slice is drawn.
++  {
++    static const unsigned skip = [] { const char* e = std::getenv("WWHD_PS5_SHADOW_SKIP"); return e && *e ? unsigned(std::strtoul(e, nullptr, 0)) : 0u; }();
++    if (skip && depth && !colors[0] && r[gx2::kDepthSlicesReg] > 1 && depthSlice < 32 && (skip >> depthSlice) & 1u) {
++      ++ps5ShadowSkipped;
++      return;
+     }
+-  if (depth && (depth->extent.width < width || depth->extent.height < height))
+-    depth = nullptr;
++  }
++#endif
    rprof::mark(rprof::kTargets);
 -  auto &p = pipeline(r, vs, ps, fs, topology, colors, depth);
 +  auto &p = fast ? *continued.pipeline : pipeline(r, vs, ps, fs, topology, colors, depth);
    rprof::mark(rprof::kPipeline);
    if (!p.pipeline && !p.pendingCompile) return;
    if (p.pendingCompile && !begin_exact_preparation()) resolve_pending_pipeline(p);
-@@ -2243,8 +2718,35 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2243,8 +2732,35 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
    if(vertex_window_stats_enabled()) report_vertex_window_stats();
    FeedbackStatsProbe feedbackProbe;
    auto* probe=feedback_stats_enabled()?&feedbackProbe:nullptr;
@@ -1149,7 +1162,7 @@ index 79e67a5..a6c9b22 100644
    // Texture uploads, feedback copies, and sampling transitions above may have
    // ended the previous pass. Reuse only its exact active attachment set.
    bool reusePass = R.rendering && R.passTracked && R.passColors == colors &&
-@@ -2328,7 +2830,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2328,7 +2844,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
      ri.pColorAttachments = attachments.data();
      ri.pDepthAttachment = depth ? &da : nullptr;
      ri.pStencilAttachment = depth && depth->fmt.stencil ? &da : nullptr;
@@ -1158,7 +1171,7 @@ index 79e67a5..a6c9b22 100644
      trace_pass(colors, ncolor, depth, depthSlice, width, height);
      record::vkCmdBeginRendering(cmd, &ri);
      ++R.renderPassCount;
-@@ -2474,6 +2976,12 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2474,6 +2990,12 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
      } else {
        const size_t bytes = size_t(count) * indexBytes;
        const auto* guest = static_cast<const uint8_t*>(mem::ptr(indexAddr));
@@ -1171,7 +1184,7 @@ index 79e67a5..a6c9b22 100644
        if (R.uploadReadsDirect) {
          nativeIndexSlice = snapshot(guest, bytes, 4);
          nativeIndexData = nativeIndexSlice.mapped;
-@@ -2556,12 +3064,24 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2556,12 +3078,24 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
          attributeEnd && stride && extent.valid && vertexExtent.valid &&
          windowEnd<=copied && windowBegin<windowEnd && windowBegin!=0;
      UploadSlice b;
@@ -1197,7 +1210,7 @@ index 79e67a5..a6c9b22 100644
      VkDeviceSize offset = b.offset;
      static const bool skipVertexBinds = [] {
        const char* e=std::getenv("WWHD_VK_SKIP_VERTEX_BINDS");
-@@ -2604,8 +3124,8 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2604,8 +3138,8 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
    }
    if(R.gpuPassTimestampsEnabled) gpu_count_render_draw();
    for (auto *color : colors)
@@ -1208,7 +1221,7 @@ index 79e67a5..a6c9b22 100644
    R.drawCount++;
    if (aoPrivateReplay) {
      aoPrivateFrame = R.frame;
-@@ -2618,6 +3138,9 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+@@ -2618,6 +3152,9 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
        ~ReplayGuard() { aoPrivateReplay = false; }
      } guard;
      draw(r, prim, count, indexType, indexAddr, baseVertex, instances);
