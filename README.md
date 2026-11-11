@@ -33,7 +33,7 @@ read in the console's log; nothing else is claimed.
 | 30 fps | The game's own rate, chosen in Settings: 30.0 frames and 30.0 game steps a second on the island's pier | |
 | Settings | Opened with the touchpad button and driven from the pad: tabs, frame rate, internal resolution, save states; choices kept across a restart | Every option in it |
 | Text entry | The console's own keyboard for the name of a new Quest Log, and the name it gave back in the game | |
-| Button prompts | The DualSense's symbols in the HUD and the pause menu: Cross, Circle, Square, Triangle, R1, R2 | L1 and L2; prompts inside message text (still the Wii U's); French and Spanish |
+| Button prompts | The DualSense's symbols in the HUD and the pause menu: Cross, Circle, Square, Triangle, R1, R2 | French and Spanish; see button coverage below |
 | Input | Menus, dialogue, walking and the camera from the sticks, the pause menu; "Wii U GamePad" chosen on the selection screen and the game still played, menus on the TV | Each button in play; rumble; motion; a second controller |
 | Saving | The game's own save from the pause menu, found again after a restart; a save state written, listed and loaded | |
 | Sound | The output opens (48 kHz stereo) and the game's sound threads run | What it sounds like: nobody has listened yet |
@@ -51,15 +51,14 @@ Known limits:
   speed). The game cannot run ahead of the render thread to make room (tried:
   the render thread read a surface the game had reused).
 - **Nothing past the first island has been measured.**
-- **Button symbols: the HUD and menus, in English.** The game prints a button's
-  letter as text over a blank button, in the font of every other HUD label. The
-  port prints those few texts as spare characters of that font and paints their
-  cells: a cross, circle, square and triangle it draws, and R1, R2, L1, L2 put
-  together from the font's own letters and digits (`ps5/src/glyphs_ps5.cpp`;
-  `WWHD_PS5_GLYPHS=0` in `env.txt` keeps the Wii U's letters). The symbol is the
-  DualSense button that plays that Wii U button, so it follows `Controls > Face
-  buttons`. The font is known by its bytes (the USA game's); button pictures
-  inside message text come from another font and still show the Wii U's.
+- **Button symbols.** With **Controls → Face buttons → by label** and
+  **Button prompts → PlayStation**, the HUD, the standalone action prompt
+  (such as Talk), and supported icons inside messages show DualSense symbols.
+  This includes the special-action star and the opening's skip icon when
+  Plus is bound to Options. The PS5 renderer builds its prompt atlas at
+  runtime, so these changes also work with a translated game and require
+  no changes to its language archives. Some UI elements, such as controller
+  diagrams, still use their original art.
 - **You make it yourself, from your dump.** The executable contains the game's
   translated code, so no built title can be shared: see "Why there is no download".
   The builder kit does it for you.
