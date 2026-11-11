@@ -2576,3 +2576,28 @@ index 064ac33..208ee66 100644
  
  // Explicit guest signals (see above). hint() is a no-op until enable_hints(); any thread. Ranges of
  // 256 MiB or more ("everything") are ignored, as GX2Invalidate's texture handling does.
+diff --git a/runtime/src/audio_out.cpp b/runtime/src/audio_out.cpp
+index 435e8c3..225ed61 100644
+--- a/runtime/src/audio_out.cpp
++++ b/runtime/src/audio_out.cpp
+@@ -322,15 +322,20 @@ void init() {
+             open_dump();
+             return;
+         }
++#ifndef __PROSPERO__
+         if (g_channels == 6) {
+             SDL_AudioSpec physical{};
+             if (!SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &physical, nullptr) ||
+                 physical.channels < 6)
+                 fallback();
+         }
++#endif
++        // PS5 AudioOut negotiates the channel count when SDL opens the port.
++        // The unopened logical device still reports SDL's stereo default.
+         SDL_AudioSpec spec{SDL_AUDIO_S16, g_channels.load(), kRate};
+         g_unit = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, render, nullptr);
+         if (!g_unit && g_channels == 6) {
++            LOG("[audio] Could not open 5.1 output: %s", SDL_GetError());
+             fallback();
+             spec.channels = 2;
+             g_unit = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, render, nullptr);
