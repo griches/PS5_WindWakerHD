@@ -1,7 +1,7 @@
 /*
  * Wind Waker HD for the PlayStation 5 - SDL3's audio driver for the console.
  *
- * One playback device: an AudioOut main port, 48 kHz stereo 16-bit, a grain
+ * One playback device: an AudioOut main port, 48 kHz 16-bit, a grain
  * of 256 frames. sceAudioOutOutput blocks while the console plays the grain
  * before, which paces SDL's audio thread.
  *
@@ -24,16 +24,21 @@ int sceAudioOutClose(int32_t port);
 #define PS5_AUDIO_USER_SYSTEM         0xff
 #define PS5_AUDIO_PORT_MAIN           0
 #define PS5_AUDIO_FORMAT_S16_STEREO   1
+#define PS5_AUDIO_FORMAT_S16_8CH      2
+#define PS5_AUDIO_SURROUND_CHANNELS   6
+#define PS5_AUDIO_PORT_CHANNELS       8
 
 struct SDL_PrivateAudioData
 {
     int port;
     Uint8 *buffer;
+    Sint16 *surround_grain;
 };
 
 static bool PS5AUDIO_OpenDevice(SDL_AudioDevice *device)
 {
     int init;
+    const bool surround = device->spec.channels == PS5_AUDIO_SURROUND_CHANNELS;
 
     device->hidden = (struct SDL_PrivateAudioData *)SDL_calloc(1, sizeof(*device->hidden));
     if (!device->hidden) {
@@ -42,7 +47,7 @@ static bool PS5AUDIO_OpenDevice(SDL_AudioDevice *device)
     device->hidden->port = -1;
 
     device->spec.format = SDL_AUDIO_S16LE;
-    device->spec.channels = 2;
+    device->spec.channels = surround ? PS5_AUDIO_SURROUND_CHANNELS : 2;
     device->spec.freq = 48000;
     device->sample_frames = PS5_AUDIO_GRAIN;
     SDL_UpdatedAudioDeviceFormat(device);
@@ -52,13 +57,21 @@ static bool PS5AUDIO_OpenDevice(SDL_AudioDevice *device)
         return false;
     }
     SDL_memset(device->hidden->buffer, 0, device->buffer_size);
+    if (surround) {
+        const size_t size = PS5_AUDIO_GRAIN * PS5_AUDIO_PORT_CHANNELS * sizeof(Sint16);
+        device->hidden->surround_grain = (Sint16 *)SDL_aligned_alloc(64, size);
+        if (!device->hidden->surround_grain) {
+            return false;
+        }
+        SDL_memset(device->hidden->surround_grain, 0, size);
+    }
 
     init = sceAudioOutInit();
     if (init < 0 && init != PS5_AUDIO_ALREADY_INITIALISED) {
         return SDL_SetError("sceAudioOutInit: 0x%08x", (unsigned)init);
     }
     device->hidden->port = sceAudioOutOpen(PS5_AUDIO_USER_SYSTEM, PS5_AUDIO_PORT_MAIN, 0, PS5_AUDIO_GRAIN, 48000,
-                                           PS5_AUDIO_FORMAT_S16_STEREO);
+                                           surround ? PS5_AUDIO_FORMAT_S16_8CH : PS5_AUDIO_FORMAT_S16_STEREO);
     if (device->hidden->port < 0) {
         return SDL_SetError("sceAudioOutOpen: 0x%08x", (unsigned)device->hidden->port);
     }
@@ -67,6 +80,17 @@ static bool PS5AUDIO_OpenDevice(SDL_AudioDevice *device)
 
 static bool PS5AUDIO_PlayDevice(SDL_AudioDevice *device, const Uint8 *buffer, int buffer_size)
 {
+    Sint16 *grain = device->hidden->surround_grain;
+    if (grain) {
+        // AudioOut takes eight slots. Put the game's six discrete channels in
+        // the first six slots (FL, FR, FC, LFE, surround L/R); leave two silent.
+        const size_t frame_bytes = PS5_AUDIO_SURROUND_CHANNELS * sizeof(Sint16);
+        SDL_assert(buffer_size == PS5_AUDIO_GRAIN * frame_bytes);
+        for (size_t frame = 0; frame < PS5_AUDIO_GRAIN; ++frame) {
+            SDL_memcpy(grain + frame * PS5_AUDIO_PORT_CHANNELS, buffer + frame * frame_bytes, frame_bytes);
+        }
+        return sceAudioOutOutput(device->hidden->port, grain) >= 0;
+    }
     return sceAudioOutOutput(device->hidden->port, buffer) >= 0;
 }
 
@@ -88,6 +112,7 @@ static void PS5AUDIO_CloseDevice(SDL_AudioDevice *device)
             (void)sceAudioOutClose(device->hidden->port);
         }
         SDL_aligned_free(device->hidden->buffer);
+        SDL_aligned_free(device->hidden->surround_grain);
         SDL_free(device->hidden);
         device->hidden = NULL;
     }
